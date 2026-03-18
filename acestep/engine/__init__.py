@@ -14,3 +14,9 @@ __all__ = [
     "blend_semantic_hints",
     "extract_semantic_hints",
 ]
+
+# TRT imports are deferred to avoid hard dependency on tensorrt
+def get_trt_decoder(engine_path, **kwargs):
+    """Convenience factory for TRTDecoder (lazy import)."""
+    from .trt.runtime import TRTDecoder
+    return TRTDecoder(engine_path, **kwargs)

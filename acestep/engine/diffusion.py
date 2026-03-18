@@ -67,13 +67,20 @@ class DiffusionEngine:
     and two-sided noise mask blending matching ComfyUI's KSamplerX0Inpaint.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, trt_decoder=None):
         """
         Args:
             model: AceStepConditionGenerationModel instance.
+            trt_decoder: Optional TRTDecoder instance.  When provided, all
+                decoder calls are routed through TensorRT instead of the
+                PyTorch model.  All engine modulations (temporal blending,
+                velocity scaling, noise masks, etc.) continue to work
+                because they operate on the velocity output, not inside
+                the decoder.
         """
         self.model = model
         self.decoder = model.decoder
+        self.trt_decoder = trt_decoder
 
     # ------------------------------------------------------------------
     # Noise generation
@@ -203,7 +210,21 @@ class DiffusionEngine:
         use_cache: bool = True,
         past_key_values: Optional[EncoderDecoderCache] = None,
     ) -> Tuple[torch.Tensor, Optional[EncoderDecoderCache]]:
-        """Single decoder forward pass."""
+        """Single decoder forward pass.
+
+        When trt_decoder is set, routes through TensorRT (no KV cache).
+        All engine modulations continue to work unchanged because they
+        operate on the velocity tensor returned here.
+        """
+        if self.trt_decoder is not None:
+            vt = self.trt_decoder(
+                hidden_states=xt,
+                timestep=t_curr_tensor,
+                encoder_hidden_states=condition.encoder_hidden_states,
+                context_latents=condition.context_latents,
+            )
+            return vt, None
+
         decoder_outputs = self.decoder(
             hidden_states=xt,
             timestep=t_curr_tensor,

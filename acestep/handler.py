@@ -7,6 +7,12 @@ import os
 # Disable tokenizers parallelism to avoid fork warning
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+# Persist torch.compile kernel cache across sessions (default is Temp, gets cleared)
+if "TORCHINDUCTOR_CACHE_DIR" not in os.environ:
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(
+        os.path.expanduser("~"), ".cache", "torchinductor"
+    )
+
 import math
 from copy import deepcopy
 import tempfile
@@ -439,16 +445,16 @@ class AceStepHandler:
                 self.model.eval()
                 
                 if compile_model:
-                    # Add __len__ method to model to support torch.compile
-                    # torch.compile's dynamo requires this method for introspection
-                    # Note: This modifies the model class, affecting all instances
-                    if not hasattr(self.model.__class__, '__len__'):
-                        def _model_len(model_self):
-                            """Return 0 as default length for torch.compile compatibility"""
-                            return 0
-                        self.model.__class__.__len__ = _model_len
-                    
-                    self.model = torch.compile(self.model)
+                    # Compile the decoder directly (not the parent model).
+                    # DiffusionEngine and other callers access model.decoder,
+                    # which would bypass a parent-level compiled wrapper.
+                    # dynamic=True avoids recompilation when encoder sequence
+                    # length changes (different prompts/lyrics). First-call
+                    # compile cost is ~80s but kernels are cached to disk via
+                    # TORCHINDUCTOR_CACHE_DIR for subsequent sessions.
+                    self.model.decoder = torch.compile(
+                        self.model.decoder, backend="inductor", dynamic=True,
+                    )
                     
                     if self.quantization is not None:
                         from torchao.quantization import quantize_
@@ -458,6 +464,9 @@ class AceStepHandler:
                         elif self.quantization == "fp8_weight_only":
                             from torchao.quantization import Float8WeightOnlyConfig
                             quant_config = Float8WeightOnlyConfig()
+                        elif self.quantization == "fp8_dynamic":
+                            from torchao.quantization import Float8DynamicActivationFloat8WeightConfig
+                            quant_config = Float8DynamicActivationFloat8WeightConfig()
                         elif self.quantization == "w8a8_dynamic":
                             from torchao.quantization import Int8DynamicActivationInt8WeightConfig, MappingType
                             quant_config = Int8DynamicActivationInt8WeightConfig(act_mapping_type=MappingType.ASYMMETRIC)
@@ -494,15 +503,7 @@ class AceStepHandler:
                 raise FileNotFoundError(f"VAE checkpoint not found at {vae_checkpoint_path}")
 
             if compile_model:
-                # Add __len__ method to VAE to support torch.compile if needed
-                # Note: This modifies the VAE class, affecting all instances
-                if not hasattr(self.vae.__class__, '__len__'):
-                    def _vae_len(vae_self):
-                        """Return 0 as default length for torch.compile compatibility"""
-                        return 0
-                    self.vae.__class__.__len__ = _vae_len
-                
-                self.vae = torch.compile(self.vae)
+                self.vae = torch.compile(self.vae, dynamic=True)
             
             # 3. Load text encoder and tokenizer
             text_encoder_path = os.path.join(checkpoint_dir, "Qwen3-Embedding-0.6B")
