@@ -7,6 +7,11 @@ from typing import Any, Callable, Optional
 
 from acestep.inference import GenerationConfig, GenerationParams
 
+# Sensible fallback when the API receives a null/missing audio_duration.
+# This prevents -1.0/None from propagating into the LLM and DiT, which
+# can cause unconstrained code generation and downstream tensor mismatches.
+_API_DEFAULT_DURATION_SECONDS: float = 120.0
+
 
 @dataclass
 class GenerationSetup:
@@ -149,7 +154,7 @@ def build_generation_setup(
         bpm=bpm,
         keyscale=key_scale,
         timesignature=time_signature,
-        duration=audio_duration if audio_duration else -1.0,
+        duration=audio_duration if audio_duration else _API_DEFAULT_DURATION_SECONDS,
         inference_steps=req.inference_steps,
         seed=req.seed,
         guidance_scale=req.guidance_scale,

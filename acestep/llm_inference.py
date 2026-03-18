@@ -2,6 +2,7 @@
 5Hz LM (Language Model) Handler
 Handles all LM-related operations including initialization and generation
 """
+import gc
 import os
 import sys
 import traceback
@@ -95,11 +96,7 @@ class LLMHandler:
             self.llm_backend = None
             self._mlx_model = None
             self._mlx_model_path = None
-            try:
-                import gc
-                gc.collect()
-            except Exception:
-                pass
+            gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
@@ -245,10 +242,17 @@ class LLMHandler:
                 # CoT phase or mixed: add larger buffer for metadata overhead.
                 max_new_tokens = target_codes + 500
         else:
+            # When no target_duration is set, cap the fallback to a safe
+            # upper bound derived from DURATION_MAX so that generation cannot
+            # produce more audio codes than the downstream DiT can handle.
+            duration_cap = DURATION_MAX * 5 + 500  # codes + metadata buffer
             if fallback_max is not None:
-                max_new_tokens = fallback_max
+                max_new_tokens = min(fallback_max, duration_cap)
             else:
-                max_new_tokens = getattr(self, "max_model_len", 4096) - 64
+                max_new_tokens = min(
+                    getattr(self, "max_model_len", 4096) - 64,
+                    duration_cap,
+                )
 
         # Cap at model's max length
         if hasattr(self, "max_model_len"):
@@ -542,6 +546,7 @@ class LLMHandler:
 
             # Proactive CUDA cleanup before LM load to reduce fragmentation on mode/model switch
             if device == "cuda" and torch.cuda.is_available():
+                gc.collect()
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
 
@@ -688,6 +693,7 @@ class LLMHandler:
             current_device = torch.cuda.current_device()
             device_name = torch.cuda.get_device_name(current_device)
 
+            gc.collect()
             torch.cuda.empty_cache()
             self._cleanup_torch_distributed_state()
 
@@ -1278,6 +1284,23 @@ class LLMHandler:
             else:
                 logger.info("Phase 1: Using user-provided metadata (skipping generation)")
             metadata = {k: v for k, v in user_metadata.items() if v is not None}
+
+        # When the caller did not supply an explicit target_duration, use the
+        # duration that Phase 1 (CoT) produced so that Phase 2 code generation
+        # is properly constrained.  Without this, a null API duration lets
+        # Phase 2 run unconstrained, potentially producing more audio codes
+        # than the downstream DiT expects and causing a tensor-size mismatch.
+        if (target_duration is None or target_duration <= 0) and metadata.get("duration"):
+            try:
+                cot_duration = float(metadata["duration"])
+                if cot_duration > 0:
+                    target_duration = cot_duration
+                    logger.info(
+                        f"Using CoT-generated duration ({cot_duration}s) as "
+                        f"Phase 2 target_duration (original was None/unset)"
+                    )
+            except (ValueError, TypeError):
+                pass
 
         # If infer_type is 'dit', stop here and return only metadata
         if infer_type == "dit":
@@ -2320,6 +2343,7 @@ class LLMHandler:
                 except Exception:
                     pass  # Ignore errors during cleanup
             # Clear accelerator cache to release any corrupted memory
+            gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
@@ -2421,6 +2445,9 @@ class LLMHandler:
 
         if streamer is not None:
             streamer.end()
+
+        # Explicitly free KV cache to reduce memory fragmentation
+        del past_key_values
 
         return generated_ids
 
@@ -2590,6 +2617,9 @@ class LLMHandler:
 
         if streamer is not None:
             streamer.end()
+
+        # Explicitly free KV cache to reduce memory fragmentation
+        del past_key_values
 
         # Return the full batch (both conditional and unconditional)
         # The caller will extract only the conditional output
@@ -3950,6 +3980,7 @@ class LLMHandler:
             if hasattr(model, "to"):
                 model.to("cpu")
             # Clear accelerator cache after offloading
+            gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             elif hasattr(torch, 'xpu') and torch.xpu.is_available():
