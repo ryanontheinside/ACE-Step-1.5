@@ -44,6 +44,14 @@ from acestep.constants import (
 )
 from acestep.dit_alignment_score import MusicStampsAligner, MusicLyricScorer
 from acestep.gpu_config import get_gpu_memory_gb
+from acestep.engine import (
+    PreparedCondition,
+    ConditionSet,
+    ConditionBuilder,
+    DiffusionEngine,
+    DiffusionConfig,
+    LatentNoiseMask,
+)
 
 
 warnings.filterwarnings("ignore")
@@ -398,10 +406,10 @@ class AceStepHandler:
                 try:
                     logger.info(f"[initialize_service] Attempting to load model with attention implementation: {attn_implementation}")
                     self.model = AutoModel.from_pretrained(
-                        acestep_v15_checkpoint_path, 
-                        trust_remote_code=True, 
+                        acestep_v15_checkpoint_path,
+                        trust_remote_code=True,
                         attn_implementation=attn_implementation,
-                        dtype="bfloat16"
+                        dtype="bfloat16",
                     )
                 except Exception as e:
                     logger.warning(f"[initialize_service] Failed to load model with {attn_implementation}: {e}")
@@ -409,9 +417,9 @@ class AceStepHandler:
                         logger.info("[initialize_service] Falling back to eager attention")
                         attn_implementation = "eager"
                         self.model = AutoModel.from_pretrained(
-                            acestep_v15_checkpoint_path, 
-                            trust_remote_code=True, 
-                            attn_implementation=attn_implementation
+                            acestep_v15_checkpoint_path,
+                            trust_remote_code=True,
+                            attn_implementation=attn_implementation,
                         )
                     else:
                         raise e
@@ -1640,6 +1648,8 @@ class AceStepHandler:
             vocal_languages = self._create_fallback_vocal_languages(batch_size)
         
         # Parse metas with fallbacks
+        if metas is None:
+            metas = [None] * batch_size
         parsed_metas = self._parse_metas(metas)
         
         # Encode target_wavs to get target_latents
@@ -2367,6 +2377,138 @@ class AceStepHandler:
         outputs["lyric_token_idss"] = lyric_token_idss
         
         return outputs
+
+    # ------------------------------------------------------------------
+    # Engine API (composable multi-condition generation)
+    # ------------------------------------------------------------------
+
+    def encode_reference_from_audio(self, audio_tensor: torch.Tensor):
+        """Encode full audio as reference latent without segment selection.
+
+        This matches ComfyUI's reference handling where the full source
+        audio is VAE-encoded and passed to the timbre encoder, instead
+        of the handler's default behavior of selecting 3 random 10-second
+        segments.
+
+        Args:
+            audio_tensor: Stereo audio [2, samples] at 48kHz.
+
+        Returns:
+            Tuple of (refer_audio_acoustic_hidden_states_packed, refer_audio_order_mask)
+            ready for use with build_condition().
+        """
+        with self._load_model_context("vae"):
+            return self.infer_refer_latent([[audio_tensor]])
+
+    @torch.no_grad()
+    def build_condition(
+        self,
+        text_hidden_states: torch.Tensor,
+        text_attention_mask: torch.Tensor,
+        lyric_hidden_states: torch.Tensor,
+        lyric_attention_mask: torch.Tensor,
+        refer_audio_acoustic_hidden_states_packed: torch.Tensor,
+        refer_audio_order_mask: torch.Tensor,
+        src_latents: torch.Tensor,
+        chunk_masks: torch.Tensor,
+        is_covers: torch.Tensor,
+        precomputed_lm_hints_25Hz: Optional[torch.Tensor] = None,
+        audio_codes: Optional[torch.Tensor] = None,
+        temporal_weight: Optional[torch.Tensor] = None,
+        step_range: Optional[Tuple[float, float]] = None,
+    ) -> PreparedCondition:
+        """Build a PreparedCondition from pre-encoded tensors.
+
+        This is the low-level engine conditioning API. It wraps
+        model.prepare_condition() and attaches compositing metadata.
+
+        For the full text-to-condition pipeline, preprocess your inputs
+        using _prepare_batch() + preprocess_batch() first, then pass the
+        resulting tensors here.
+
+        Args:
+            text_hidden_states: Encoded text embeddings [B, L_text, D].
+            text_attention_mask: Text mask [B, L_text].
+            lyric_hidden_states: Encoded lyric embeddings [B, L_lyric, D].
+            lyric_attention_mask: Lyric mask [B, L_lyric].
+            refer_audio_acoustic_hidden_states_packed: Packed reference audio features.
+            refer_audio_order_mask: Batch assignment mask for packed features.
+            src_latents: Source audio latents [B, T, D].
+            chunk_masks: Generation region masks [B, T, D].
+            is_covers: Cover task indicators [B].
+            precomputed_lm_hints_25Hz: Pre-encoded semantic hints (optional).
+            audio_codes: Quantized audio codes (optional).
+            temporal_weight: Per-frame blend weight (optional).
+            step_range: Diffusion step range as (start_frac, end_frac) (optional).
+
+        Returns:
+            PreparedCondition ready for use in a ConditionSet.
+        """
+        self._ensure_silence_latent_on_device()
+        builder = ConditionBuilder(self.model)
+        with self._load_model_context("model"):
+            return builder.build(
+                text_hidden_states=text_hidden_states,
+                text_attention_mask=text_attention_mask,
+                lyric_hidden_states=lyric_hidden_states,
+                lyric_attention_mask=lyric_attention_mask,
+                refer_audio_acoustic_hidden_states_packed=refer_audio_acoustic_hidden_states_packed,
+                refer_audio_order_mask=refer_audio_order_mask,
+                src_latents=src_latents,
+                chunk_masks=chunk_masks,
+                is_covers=is_covers,
+                silence_latent=self.silence_latent,
+                precomputed_lm_hints_25Hz=precomputed_lm_hints_25Hz,
+                audio_codes=audio_codes,
+                temporal_weight=temporal_weight,
+                step_range=step_range,
+            )
+
+    @torch.no_grad()
+    def engine_generate(
+        self,
+        condition_set: ConditionSet,
+        config: DiffusionConfig,
+        latent_mask: Optional[LatentNoiseMask] = None,
+        source_latents: Optional[torch.Tensor] = None,
+        apply_hooks_fn=None,
+        **kwargs,
+    ) -> dict:
+        """Generate audio using the composable conditioning engine.
+
+        This is the engine counterpart of service_generate(). It accepts a
+        ConditionSet (one or more PreparedConditions) and a DiffusionConfig,
+        and runs the enhanced diffusion loop.
+
+        The returned dict matches the format of model.generate_audio():
+            - target_latents: Generated latents [B, T, D].
+            - time_costs: Timing breakdown dict.
+
+        Args:
+            condition_set: Conditions for generation.
+            config: Diffusion loop parameters.
+            latent_mask: Optional noise mask for inpainting / blending.
+            source_latents: Source audio latents [B, T, D] for partial
+                denoising (config.denoise < 1.0).
+            apply_hooks_fn: Optional callback for per-condition model
+                weight switching (LoRA, hooks).
+            **kwargs: Additional arguments passed to DiffusionEngine.generate().
+                Supported: sde_denoise_curve, velocity_scale,
+                initial_noise_curve, x0_target, x0_target_curve.
+
+        Returns:
+            Dict with target_latents and time_costs.
+        """
+        engine = DiffusionEngine(self.model)
+        with self._load_model_context("model"):
+            return engine.generate(
+                condition_set=condition_set,
+                config=config,
+                latent_mask=latent_mask,
+                source_latents=source_latents,
+                apply_hooks_fn=apply_hooks_fn,
+                **kwargs,
+            )
 
     def tiled_decode(self, latents, chunk_size=512, overlap=64, offload_wav_to_cpu=True):
         """
