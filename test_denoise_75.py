@@ -176,18 +176,31 @@ def main():
         del engine, result
         torch.cuda.empty_cache()
 
-        print("   VAE decode...")
-        with handler._load_model_context("vae"):
-            audio_out = handler.vae.decode(xt.transpose(1, 2))
-            if hasattr(audio_out, 'sample'):
-                audio_out = audio_out.sample
-            audio_np = audio_out.squeeze(0).detach().cpu().float().numpy().T
+        print("   VAE decode (TRT)...")
+        import tensorrt as trt
+        if not hasattr(main, '_trt_ctx'):
+            _rt = trt.Runtime(trt.Logger(trt.Logger.WARNING))
+            with open(os.path.join(project_root, "trt_engines", "vae_decode_fp16.engine"), "rb") as _f:
+                _eng = _rt.deserialize_cuda_engine(_f.read())
+            main._trt_ctx = _eng.create_execution_context()
+            main._trt_eng = _eng
+        _ctx = main._trt_ctx
+        _lat = xt.transpose(1, 2).float().contiguous()
+        _ctx.set_input_shape("latents", tuple(_lat.shape))
+        _ctx.set_tensor_address("latents", _lat.data_ptr())
+        _out_shape = tuple(_ctx.get_tensor_shape("audio"))
+        _audio_buf = torch.empty(_out_shape, dtype=torch.float32, device=device)
+        _ctx.set_tensor_address("audio", _audio_buf.data_ptr())
+        _stream = torch.cuda.current_stream()
+        _ctx.execute_async_v3(_stream.cuda_stream)
+        _stream.synchronize()
+        audio_np = _audio_buf.squeeze(0).cpu().numpy().T
 
-        name = f"denoise_{int(denoise_val * 100):03d}"
+        name = f"denoise_{int(denoise_val * 100):03d}_trt"
         path = os.path.join(OUTPUT_DIR, f"{name}.wav")
         sf.write(path, audio_np, 48000)
         print(f"   Saved: {path}")
-        del xt, audio_out, audio_np
+        del xt, audio_np
         torch.cuda.empty_cache()
 
     print("\nDone.")

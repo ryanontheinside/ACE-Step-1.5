@@ -30,9 +30,16 @@ dependencies = [
     # Training dependencies
     "peft>=0.7.0",
     "lightning>=2.0.0",
+    "tensorboard>=2.0.0",
+    # Attention / inference dependencies
+    "triton-windows>=3.0.0,<3.4; sys_platform == 'win32'",
+    "triton>=3.0.0; sys_platform != 'win32'",
+    "flash-attn @ https://github.com/kingbri1/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu128torch2.9.0cxx11abiFALSE-cp311-cp311-win_amd64.whl ; sys_platform == 'win32' and python_version == '3.11' and platform_machine == 'AMD64'",
+    "flash-attn @ https://github.com/kingbri1/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu128torch2.9.0cxx11abiFALSE-cp311-cp311-linux_x86_64.whl ; sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'x86_64'",
+    "xxhash",
     # Local third-party packages
     "nano-vllm",
-    "modelscope"
+    "modelscope",
 ]
 
 [[tool.uv.index]]
