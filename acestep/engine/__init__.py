@@ -2,6 +2,7 @@ from .conditions import PreparedCondition, ConditionSet, ConditionBuilder
 from .diffusion import DiffusionEngine, DiffusionConfig
 from .masking import LatentNoiseMask
 from .ops import average_conditions, blend_semantic_hints, extract_semantic_hints
+from .pipeline import GenerationPipeline
 
 __all__ = [
     "PreparedCondition",
@@ -13,6 +14,7 @@ __all__ = [
     "average_conditions",
     "blend_semantic_hints",
     "extract_semantic_hints",
+    "GenerationPipeline",
 ]
 
 # TRT imports are deferred to avoid hard dependency on tensorrt

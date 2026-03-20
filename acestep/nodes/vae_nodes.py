@@ -181,6 +181,13 @@ class VAEEncodeAudio(BaseNode):
             if latents.dim() == 2:
                 latents = latents.unsqueeze(0)
 
+        # Pad T to multiple of 5 (required by model tokenizer)
+        T = latents.shape[1]
+        pad_to = 5
+        if T % pad_to != 0:
+            pad_amount = pad_to - (T % pad_to)
+            latents = torch.nn.functional.pad(latents, (0, 0, 0, pad_amount))
+
         return {"latent": Latent(tensor=latents)}
 
 
