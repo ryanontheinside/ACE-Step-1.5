@@ -452,8 +452,21 @@ class AceStepHandler:
                     # length changes (different prompts/lyrics). First-call
                     # compile cost is ~80s but kernels are cached to disk via
                     # TORCHINDUCTOR_CACHE_DIR for subsequent sessions.
+                    #
+                    # allow_unspec_int_on_nn_module prevents recompilation
+                    # per transformer layer (layer_idx treated as dynamic).
+                    # Without this, dynamo hits the recompile limit and falls
+                    # back to eager execution for half the layers.
+                    torch._dynamo.config.allow_unspec_int_on_nn_module = True
+
+                    compile_mode = "max-autotune-no-cudagraphs"
+                    if self.quantization is not None:
+                        # FP8/int8 tensors don't support all autotune ops yet
+                        compile_mode = "default"
+
                     self.model.decoder = torch.compile(
                         self.model.decoder, backend="inductor", dynamic=True,
+                        mode=compile_mode,
                     )
                     
                     if self.quantization is not None:
@@ -2500,7 +2513,9 @@ class AceStepHandler:
         Returns:
             Dict with target_latents and time_costs.
         """
-        engine = DiffusionEngine(self.model)
+        if not hasattr(self, '_diffusion_engine') or self._diffusion_engine is None:
+            self._diffusion_engine = DiffusionEngine(self.model)
+        engine = self._diffusion_engine
         with self._load_model_context("model"):
             return engine.generate(
                 condition_set=condition_set,

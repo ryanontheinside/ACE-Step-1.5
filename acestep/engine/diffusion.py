@@ -81,6 +81,122 @@ class DiffusionEngine:
         self.model = model
         self.decoder = model.decoder
         self.trt_decoder = trt_decoder
+        self._compiled_loop: Optional[Callable] = None
+
+    # ------------------------------------------------------------------
+    # CUDA graph fast path
+    # ------------------------------------------------------------------
+
+    def _can_use_fast_path(
+        self,
+        condition_set: ConditionSet,
+        config: DiffusionConfig,
+        latent_mask: Optional[LatentNoiseMask],
+        velocity_scale: Optional[torch.Tensor],
+        sde_denoise_curve: Optional[torch.Tensor],
+        x0_target: Optional[torch.Tensor],
+        apply_hooks_fn: Optional[Callable],
+    ) -> bool:
+        """Check if the precomputed fast path is viable."""
+        if config.infer_method != "ode":
+            return False
+        if latent_mask is not None:
+            return False
+        if velocity_scale is not None or sde_denoise_curve is not None:
+            return False
+        if x0_target is not None:
+            return False
+        if apply_hooks_fn is not None:
+            return False
+        if not condition_set.is_single_condition:
+            return False
+        return True
+
+    def _generate_fast(
+        self,
+        condition_set: ConditionSet,
+        config: DiffusionConfig,
+        noise: torch.Tensor,
+        t_schedule: torch.Tensor,
+        source_latents: Optional[torch.Tensor],
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Precomputed fast path: single condition, ODE, no modulation.
+
+        Delegates to a compiled inner loop that the torch compiler can
+        see as a single graph (no Python overhead between steps).
+        """
+        device = noise.device
+        dtype = noise.dtype
+        bsz = noise.shape[0]
+        infer_steps = len(t_schedule) - 1
+        cond = condition_set.conditions[0]
+
+        # Initial state
+        t_start = t_schedule[0].item()
+        if config.denoise < 1.0 and source_latents is not None:
+            xt = t_start * noise + (1.0 - t_start) * source_latents
+        else:
+            xt = noise.clone()
+
+        # Precompute schedule as stacked tensors (no per-step Python)
+        t_curr_vec = t_schedule[:-1].unsqueeze(-1).expand(infer_steps, bsz)  # [steps, B]
+        dt_vec = (t_schedule[:-1] - t_schedule[1:])  # [steps]
+        # Final step: dt = t_curr (returns x0)
+        dt_vec = dt_vec.clone()
+        dt_vec[-1] = t_schedule[-2]
+        # [steps] -> [steps, 1, 1] for broadcasting with [B, T, D]
+        dt_vec = dt_vec.reshape(infer_steps, 1, 1)  # [steps, 1, 1]
+
+        # Run compiled inner loop
+        if self._compiled_loop is None:
+            self._compiled_loop = torch.compile(
+                self._fast_loop,
+                backend="inductor",
+                dynamic=False,
+                mode="max-autotune-no-cudagraphs",
+            )
+
+        return self._compiled_loop(
+            self.decoder, xt, t_curr_vec, dt_vec,
+            attention_mask,
+            cond.encoder_hidden_states,
+            cond.encoder_attention_mask,
+            cond.context_latents,
+            infer_steps,
+        )
+
+    @staticmethod
+    def _fast_loop(
+        decoder,
+        xt: torch.Tensor,
+        t_curr_vec: torch.Tensor,
+        dt_vec: torch.Tensor,
+        attention_mask: torch.Tensor,
+        enc_hs: torch.Tensor,
+        enc_mask: torch.Tensor,
+        ctx_lat: torch.Tensor,
+        infer_steps: int,
+    ) -> torch.Tensor:
+        """Inner loop as a standalone function for torch.compile.
+
+        By compiling this separately, the compiler can see the full loop
+        and optimize across step boundaries.
+        """
+        for i in range(infer_steps):
+            vt = decoder(
+                hidden_states=xt,
+                timestep=t_curr_vec[i],
+                timestep_r=t_curr_vec[i],
+                attention_mask=attention_mask,
+                encoder_hidden_states=enc_hs,
+                encoder_attention_mask=enc_mask,
+                context_latents=ctx_lat,
+                use_cache=False,
+                past_key_values=None,
+            )[0]
+            xt = xt - vt * dt_vec[i]
+        return xt
 
     # ------------------------------------------------------------------
     # Noise generation
@@ -583,6 +699,27 @@ class DiffusionEngine:
             # No denoising: return source latents directly
             out = source_latents if source_latents is not None else noise
             return {"target_latents": out, "time_costs": {}}
+
+        # ---- Precomputed fast path ----
+        if self._can_use_fast_path(
+            condition_set, config, latent_mask,
+            velocity_scale, sde_denoise_curve, x0_target, apply_hooks_fn,
+        ) and initial_noise_curve is None:
+            diffusion_start = time.time()
+            xt = self._generate_fast(
+                condition_set, config, noise, t_schedule,
+                source_latents, attention_mask,
+            )
+            diffusion_end = time.time()
+            time_costs["diffusion_time_cost"] = diffusion_end - diffusion_start
+            time_costs["diffusion_per_step_time_cost"] = (
+                time_costs["diffusion_time_cost"] / max(infer_steps, 1)
+            )
+            time_costs["total_time_cost"] = diffusion_end - total_start_time
+            time_costs["fast_path"] = True
+            return {"target_latents": xt, "time_costs": time_costs}
+
+        # ---- Standard path ----
 
         # Initial state
         t_start = t_schedule[0].item()
