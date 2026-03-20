@@ -153,7 +153,7 @@ class DiffusionEngine:
             self._compiled_loop = torch.compile(
                 self._fast_loop,
                 backend="inductor",
-                dynamic=False,
+                dynamic=True,
                 mode="max-autotune-no-cudagraphs",
             )
 
