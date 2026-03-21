@@ -170,21 +170,32 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_prepare_source(self):
         """POST /prepare_source
         Body: raw audio bytes.
-        Params via query string OR headers (X-Source-Name, X-Duration).
+        Params via query string OR headers (X-Source-Name).
         """
         params = self._parse_query()
         name = params.get("name") or self.headers.get("X-Source-Name", "default")
-        duration = float(params.get("duration") or self.headers.get("X-Duration", "60"))
 
         # Read audio from request body
         audio_bytes = self._read_body_bytes()
         audio = _audio_from_bytes(audio_bytes)
-        # Trim to duration
-        max_samples = int(duration * audio.sample_rate)
-        audio = type(audio)(
-            waveform=audio.waveform[:, :max_samples],
-            sample_rate=audio.sample_rate,
-        )
+
+        # Snap to nearest multiple of 5 latent frames (9600 audio samples)
+        samples_per_pool = 1920 * 5  # 9600
+        n_samples = audio.waveform.shape[-1]
+        remainder = n_samples % samples_per_pool
+        if remainder != 0:
+            if remainder <= samples_per_pool // 2:
+                # Trim
+                audio = type(audio)(
+                    waveform=audio.waveform[:, :n_samples - remainder],
+                    sample_rate=audio.sample_rate,
+                )
+            else:
+                # Pad
+                audio = type(audio)(
+                    waveform=torch.nn.functional.pad(audio.waveform, (0, samples_per_pool - remainder)),
+                    sample_rate=audio.sample_rate,
+                )
 
         t0 = time.perf_counter()
         source = self.state.session.prepare_source(audio)

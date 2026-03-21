@@ -114,12 +114,7 @@ def _trt_vae_encode(
 
 
 def _find_trt_engine(name: str) -> Optional[str]:
-    """Search for a TRT engine file in common locations.
-
-    Checks trt_engines_local first (build script output), then trt_engines
-    (symlinked or manually placed). Searches both CWD-relative and
-    package-relative paths.
-    """
+    """Search for a TRT engine file in trt_engines/."""
     pkg_root = os.path.join(os.path.dirname(__file__), "..", "..")
     candidates = [
         os.path.join("trt_engines", name),
@@ -130,6 +125,7 @@ def _find_trt_engine(name: str) -> Optional[str]:
         if os.path.exists(p):
             return p
     return None
+
 
 
 # -----------------------------------------------------------------------
@@ -174,7 +170,7 @@ class VAEEncodeAudio(BaseNode):
         if waveform.dim() == 2:
             waveform = waveform.unsqueeze(0)
 
-        trt_path = _find_trt_engine("vae_encode_fp16.engine") if _trt_available() else None
+        trt_path = _find_trt_engine("vae_encode_fp16_max6000.engine") if _trt_available() else None
         if trt_path:
             logger.info("VAE encode via TRT")
             latents_bdt = _trt_vae_encode(waveform, trt_path, device)
@@ -225,7 +221,7 @@ class VAEDecodeAudio(BaseNode):
         # [B, T, D] -> [B, D, T]
         lat_bdt = latent.tensor.transpose(1, 2)
 
-        trt_path = _find_trt_engine("vae_decode_fp16.engine") if _trt_available() else None
+        trt_path = _find_trt_engine("vae_decode_fp16_max6000.engine") if _trt_available() else None
         if trt_path:
             logger.info("VAE decode via TRT")
             waveform = _trt_vae_decode(lat_bdt, trt_path, device)
