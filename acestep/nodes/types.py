@@ -120,7 +120,6 @@ class ConditioningEntry:
     """
     encoder_hidden_states: torch.Tensor  # [B, L_enc, D]
     encoder_attention_mask: torch.Tensor  # [B, L_enc]
-    context_latents: torch.Tensor  # [B, T, D_ctx]
     temporal_weight: Optional[torch.Tensor] = None  # [T], [B,T], or [B,T,1]
     step_range: Optional[Tuple[float, float]] = None
     hook_ref: Optional[Any] = None
@@ -129,7 +128,11 @@ class ConditioningEntry:
 @_register
 @dataclass
 class Conditioning:
-    """Encoded conditioning ready for the diffusion decoder.
+    """Encoded cross-attention conditioning for the diffusion decoder.
+
+    Contains encoder_hidden_states (packed text + lyrics + timbre) and
+    the corresponding attention mask. Context latents (src_latents +
+    chunk_mask) are built separately by Generate from explicit inputs.
 
     Can represent a single condition (from TextEncode) or a combined
     set (from ConditioningCombine). When entries is None, the top-level
@@ -141,7 +144,6 @@ class Conditioning:
     # Single condition tensors (populated by TextEncode and similar)
     encoder_hidden_states: Optional[torch.Tensor] = None  # [B, L_enc, D]
     encoder_attention_mask: Optional[torch.Tensor] = None  # [B, L_enc]
-    context_latents: Optional[torch.Tensor] = None  # [B, T, D_ctx]
 
     # Combined conditions (populated by ConditioningCombine)
     entries: Optional[List[ConditioningEntry]] = field(default=None, repr=False)
@@ -160,7 +162,6 @@ class Conditioning:
             ConditioningEntry(
                 encoder_hidden_states=self.encoder_hidden_states,
                 encoder_attention_mask=self.encoder_attention_mask,
-                context_latents=self.context_latents,
             )
         ]
 

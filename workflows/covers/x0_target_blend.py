@@ -28,9 +28,10 @@ from acestep.nodes import Audio
 from acestep.nodes.model_nodes import LoadModel
 from acestep.nodes.vae_nodes import VAEEncodeAudio, VAEDecodeAudio
 from acestep.nodes.cond_nodes import TextEncode
-from acestep.nodes.semantic_nodes import SemanticExtract
+from acestep.nodes.semantic_nodes import SemanticExtract, SemanticHintsToLatent
 from acestep.nodes.curve_nodes import CurveRamp
 from acestep.nodes.diffusion_nodes import DiffusionConfigNode, Generate
+from acestep.constants import TASK_INSTRUCTIONS
 
 SOURCE_AUDIO = os.path.join(project_root, "test_audio", "new_order_confusion_60seconds.wav")
 OUTPUT_DIR = os.path.join(project_root, "test_output", "workflows")
@@ -76,15 +77,15 @@ def main():
     source_latent = VAEEncodeAudio().execute(vae=vae, audio=source_audio)["latent"]
     T = source_latent.tensor.shape[1]
     hints = SemanticExtract().execute(model=model, latent=source_latent)["semantic_hints"]
+    context_latent = SemanticHintsToLatent().execute(semantic_hints=hints)["latent"]
 
     # --- Step 1: Generate the target latent (daft punk style) ---
     print("\n[Pass 1] Generating target latent (daft punk style)...")
     target_cond = TextEncode().execute(
         clip=clip, model=model,
-        source_latent=source_latent,
-        semantic_hints=hints,
+        refer_latent=source_latent,
         tags="daft punk style electronic french house",
-        task="cover",
+        instruction=TASK_INSTRUCTIONS["cover"],
         bpm=136, duration=60.0, key="G# minor",
     )["conditioning"]
 
@@ -97,6 +98,7 @@ def main():
         model=model,
         config=target_config,
         positive=target_cond,
+        context_latent=context_latent,
         source_latent=source_latent,
     )["latent"]
     print(f"  Target generated in {time.time() - t0:.2f}s")
@@ -105,10 +107,9 @@ def main():
     print("\n[Pass 2] Generating with x0 target blend...")
     source_cond = TextEncode().execute(
         clip=clip, model=model,
-        source_latent=source_latent,
-        semantic_hints=hints,
+        refer_latent=source_latent,
         tags="deathstep death deaht deaht",
-        task="cover",
+        instruction=TASK_INSTRUCTIONS["cover"],
         bpm=136, duration=60.0, key="G# minor",
     )["conditioning"]
 
@@ -126,6 +127,7 @@ def main():
         model=model,
         config=blend_config,
         positive=source_cond,
+        context_latent=context_latent,
         source_latent=source_latent,
         x0_target=target_latent,
         x0_target_curve=blend_curve,

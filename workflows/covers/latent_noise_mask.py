@@ -22,10 +22,11 @@ from acestep.nodes import Audio
 from acestep.nodes.model_nodes import LoadModel
 from acestep.nodes.vae_nodes import VAEEncodeAudio, VAEDecodeAudio
 from acestep.nodes.cond_nodes import TextEncode
-from acestep.nodes.semantic_nodes import SemanticExtract
+from acestep.nodes.semantic_nodes import SemanticExtract, SemanticHintsToLatent
 from acestep.nodes.curve_nodes import CurveWave
 from acestep.nodes.mask_nodes import TemporalMask, SetLatentNoiseMask
 from acestep.nodes.diffusion_nodes import DiffusionConfigNode, Generate
+from acestep.constants import TASK_INSTRUCTIONS
 
 SOURCE_AUDIO = os.path.join(project_root, "test_audio", "new_order_confusion_60seconds.wav")
 OUTPUT_DIR = os.path.join(project_root, "test_output", "workflows")
@@ -95,14 +96,14 @@ def main():
 
     # --- Encode text ---
     hints = SemanticExtract().execute(model=model, latent=source_latent)["semantic_hints"]
+    context_latent = SemanticHintsToLatent().execute(semantic_hints=hints)["latent"]
 
     conditioning = TextEncode().execute(
         clip=clip,
         model=model,
-        source_latent=source_latent,
-        semantic_hints=hints,
+        refer_latent=source_latent,
         tags="driving techno with insane synths",
-        task="cover",
+        instruction=TASK_INSTRUCTIONS["cover"],
         bpm=136,
         duration=60.0,
     )["conditioning"]
@@ -117,6 +118,7 @@ def main():
         model=model,
         config=config,
         positive=conditioning,
+        context_latent=context_latent,
         source_latent=masked_latent,
     )["latent"]
     print(f"Generated in {time.time() - t0:.2f}s")

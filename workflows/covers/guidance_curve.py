@@ -24,9 +24,10 @@ from acestep.nodes import Audio
 from acestep.nodes.model_nodes import LoadModel
 from acestep.nodes.vae_nodes import VAEEncodeAudio, VAEDecodeAudio
 from acestep.nodes.cond_nodes import TextEncode, ConditioningZeroOut
-from acestep.nodes.semantic_nodes import SemanticExtract
+from acestep.nodes.semantic_nodes import SemanticExtract, SemanticHintsToLatent
 from acestep.nodes.curve_nodes import CurveRamp
 from acestep.nodes.diffusion_nodes import DiffusionConfigNode, Generate
+from acestep.constants import TASK_INSTRUCTIONS
 
 SOURCE_AUDIO = os.path.join(project_root, "test_audio", "new_order_confusion_60seconds.wav")
 OUTPUT_DIR = os.path.join(project_root, "test_output", "workflows")
@@ -71,14 +72,14 @@ def main():
     source_latent = VAEEncodeAudio().execute(vae=vae, audio=source_audio)["latent"]
     T = source_latent.tensor.shape[1]
     hints = SemanticExtract().execute(model=model, latent=source_latent)["semantic_hints"]
+    context_latent = SemanticHintsToLatent().execute(semantic_hints=hints)["latent"]
 
     # --- Positive conditioning ---
     positive = TextEncode().execute(
         clip=clip, model=model,
-        source_latent=source_latent,
-        semantic_hints=hints,
+        refer_latent=source_latent,
         tags="deathstep death deaht deaht",
-        task="cover",
+        instruction=TASK_INSTRUCTIONS["cover"],
         bpm=136, duration=60.0, key="G# minor",
     )["conditioning"]
 
@@ -105,6 +106,7 @@ def main():
         config=config,
         positive=positive,
         negative=negative,
+        context_latent=context_latent,
         source_latent=source_latent,
         guidance_curve=cfg_curve,
     )["latent"]

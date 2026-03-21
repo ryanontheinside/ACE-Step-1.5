@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 def main():
     parser = argparse.ArgumentParser(description="Build ACE-Step TRT engines")
-    parser.add_argument("--output-dir", default=os.path.join(project_root, "trt_engines_local"),
+    parser.add_argument("--output-dir", default=os.path.join(project_root, "trt_engines"),
                         help="Directory for ONNX and engine files")
     parser.add_argument("--checkpoint", default="acestep-v15-turbo",
                         help="Model checkpoint directory name")

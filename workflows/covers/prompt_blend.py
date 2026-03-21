@@ -23,9 +23,10 @@ from acestep.nodes import Audio, Mask
 from acestep.nodes.model_nodes import LoadModel
 from acestep.nodes.vae_nodes import VAEEncodeAudio, VAEDecodeAudio
 from acestep.nodes.cond_nodes import TextEncode, ConditioningCombine
-from acestep.nodes.semantic_nodes import SemanticExtract
+from acestep.nodes.semantic_nodes import SemanticExtract, SemanticHintsToLatent
 from acestep.nodes.curve_nodes import CurveWave
 from acestep.nodes.diffusion_nodes import DiffusionConfigNode, Generate
+from acestep.constants import TASK_INSTRUCTIONS
 
 SOURCE_AUDIO = os.path.join(project_root, "test_audio", "new_order_confusion_60seconds.wav")
 OUTPUT_DIR = os.path.join(project_root, "test_output", "workflows")
@@ -69,27 +70,26 @@ def main():
     source_latent = VAEEncodeAudio().execute(vae=vae, audio=source_audio)["latent"]
     T = source_latent.tensor.shape[1]
     hints = SemanticExtract().execute(model=model, latent=source_latent)["semantic_hints"]
+    context_latent = SemanticHintsToLatent().execute(semantic_hints=hints)["latent"]
 
     # --- Encode two different prompts (both as covers of the source) ---
     print("\n[TextEncode] Prompt A: daft punk style")
     cond_a = TextEncode().execute(
         clip=clip, model=model,
-        source_latent=source_latent,
-        semantic_hints=hints,
+        refer_latent=source_latent,
         tags="daft punk style electronic french house",
         lyrics="",
-        task="cover",
+        instruction=TASK_INSTRUCTIONS["cover"],
         bpm=136, duration=60.0, key="G# minor",
     )["conditioning"]
 
     print("[TextEncode] Prompt B: heavy demon techno")
     cond_b = TextEncode().execute(
         clip=clip, model=model,
-        source_latent=source_latent,
-        semantic_hints=hints,
+        refer_latent=source_latent,
         tags="heavy demon techno, growling bass, industrial",
         lyrics="",
-        task="cover",
+        instruction=TASK_INSTRUCTIONS["cover"],
         bpm=136, duration=60.0, key="G# minor",
     )["conditioning"]
 
@@ -125,6 +125,7 @@ def main():
         model=model,
         config=config,
         positive=combined,
+        context_latent=context_latent,
         source_latent=source_latent,
     )["latent"]
     print(f"Generated in {time.time() - t0:.2f}s")

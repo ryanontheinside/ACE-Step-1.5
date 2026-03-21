@@ -22,8 +22,9 @@ from acestep.nodes import Audio
 from acestep.nodes.model_nodes import LoadModel
 from acestep.nodes.vae_nodes import VAEEncodeAudio, VAEDecodeAudio
 from acestep.nodes.cond_nodes import TextEncode, ConditioningAverage
-from acestep.nodes.semantic_nodes import SemanticExtract
+from acestep.nodes.semantic_nodes import SemanticExtract, SemanticHintsToLatent
 from acestep.nodes.diffusion_nodes import DiffusionConfigNode, Generate
+from acestep.constants import TASK_INSTRUCTIONS
 
 SOURCE_AUDIO = os.path.join(project_root, "test_audio", "new_order_confusion_60seconds.wav")
 OUTPUT_DIR = os.path.join(project_root, "test_output", "workflows")
@@ -66,27 +67,26 @@ def main():
     source_audio = load_audio(SOURCE_AUDIO)
     source_latent = VAEEncodeAudio().execute(vae=vae, audio=source_audio)["latent"]
     hints = SemanticExtract().execute(model=model, latent=source_latent)["semantic_hints"]
+    context_latent = SemanticHintsToLatent().execute(semantic_hints=hints)["latent"]
 
     # --- Encode two different prompts ---
     print("\n[TextEncode] Prompt A: deathstep")
     cond_a = TextEncode().execute(
         clip=clip, model=model,
-        source_latent=source_latent,
-        semantic_hints=hints,
+        refer_latent=source_latent,
         tags="deathstep death deaht deaht",
         lyrics="",
-        task="cover",
+        instruction=TASK_INSTRUCTIONS["cover"],
         bpm=136, duration=60.0, key="G# minor",
     )["conditioning"]
 
     print("[TextEncode] Prompt B: ambient angelic synths")
     cond_b = TextEncode().execute(
         clip=clip, model=model,
-        source_latent=source_latent,
-        semantic_hints=hints,
+        refer_latent=source_latent,
         tags="ambiet angelic synths a lot of synths",
         lyrics="",
-        task="cover",
+        instruction=TASK_INSTRUCTIONS["cover"],
         bpm=136, duration=60.0, key="G# minor",
     )["conditioning"]
 
@@ -108,6 +108,7 @@ def main():
         model=model,
         config=config,
         positive=blended,
+        context_latent=context_latent,
         source_latent=source_latent,
     )["latent"]
     print(f"Generated in {time.time() - t0:.2f}s")

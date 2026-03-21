@@ -22,9 +22,10 @@ from acestep.nodes import Audio
 from acestep.nodes.model_nodes import LoadModel
 from acestep.nodes.vae_nodes import VAEEncodeAudio, VAEDecodeAudio
 from acestep.nodes.cond_nodes import TextEncode
-from acestep.nodes.semantic_nodes import SemanticExtract, SemanticBlend
+from acestep.nodes.semantic_nodes import SemanticExtract, SemanticBlend, SemanticHintsToLatent
 from acestep.nodes.curve_nodes import CurveWave
 from acestep.nodes.diffusion_nodes import DiffusionConfigNode, Generate
+from acestep.constants import TASK_INSTRUCTIONS
 
 SOURCE_A = os.path.join(project_root, "test_audio", "new_order_confusion_60seconds.wav")
 SOURCE_B = os.path.join(project_root, "test_audio", "new_order_confusion_60seconds.wav")  # same file for demo
@@ -94,16 +95,16 @@ def main():
         hints_b=hints_b,
         blend_curve=blend_curve,
     )["semantic_hints"]
+    context_latent = SemanticHintsToLatent().execute(semantic_hints=blended_hints)["latent"]
 
     # --- Encode text prompt with blended hints ---
     conditioning = TextEncode().execute(
         clip=clip,
         model=model,
-        source_latent=latent_a,
-        semantic_hints=blended_hints,
+        refer_latent=latent_a,
         tags="jazz piano cover with swing rhythm",
         lyrics="",
-        task="cover",
+        instruction=TASK_INSTRUCTIONS["cover"],
         bpm=136,
         duration=60.0,
         key="C major",
@@ -118,6 +119,7 @@ def main():
         model=model,
         config=config,
         positive=conditioning,
+        context_latent=context_latent,
         source_latent=latent_a,
     )["latent"]
 

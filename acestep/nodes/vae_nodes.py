@@ -122,10 +122,6 @@ def _find_trt_engine(name: str) -> Optional[str]:
     """
     pkg_root = os.path.join(os.path.dirname(__file__), "..", "..")
     candidates = [
-        os.path.join("trt_engines_fresh", name),
-        os.path.join(pkg_root, "trt_engines_fresh", name),
-        os.path.join("trt_engines_local", name),
-        os.path.join(pkg_root, "trt_engines_local", name),
         os.path.join("trt_engines", name),
         os.path.join(pkg_root, "trt_engines", name),
     ]

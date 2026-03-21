@@ -7,29 +7,33 @@ from typing import Any, ClassVar, Optional
 
 from .base import BaseNode, NodeDefinition, NodePort, NodeRegistry
 from .types import (
-    Audio,
     CLIPHandle,
     Conditioning,
     ConditioningEntry,
     Latent,
     Mask,
     ModelHandle,
-    SemanticHints,
 )
+from ..constants import TASK_INSTRUCTIONS
 
 
 @NodeRegistry.register
 class TextEncode(BaseNode):
-    """Encode text prompt and build a conditioning for the decoder.
+    """Encode text prompt into cross-attention conditioning.
 
-    Directly tokenizes text/lyrics, encodes embeddings, and calls
-    model.prepare_condition(). Based on the proven pattern from the
-    test scripts (not the handler's batch pipeline).
+    Tokenizes text/lyrics, encodes timbre from a reference latent, and
+    packs everything via model.encoder() into encoder_hidden_states.
+
+    Does NOT build context_latents; that is handled by Generate from
+    explicit source_latent + chunk_mask inputs.
 
     Node parameters:
         tags: Genre/style tags string.
         lyrics: Song lyrics (empty string for instrumental).
-        task: "generate" or "cover".
+        instruction: Instruction text for the model. Standard options:
+            - "Fill the audio semantic mask based on the given conditions:" (text2music)
+            - "Generate audio semantic tokens based on the given conditions:" (cover)
+            - "Repaint the mask area based on the given conditions:" (repaint)
         bpm: Beats per minute.
         duration: Duration in seconds.
         key: Musical key (e.g. "G# minor").
@@ -45,27 +49,15 @@ class TextEncode(BaseNode):
             node_type_id=cls.node_type_id,
             display_name="ACE-Step Text Encode",
             category="conditioning",
-            description="Encode tags, lyrics, and source audio into conditioning.",
+            description="Encode tags, lyrics, and timbre into cross-attention conditioning.",
             inputs=(
                 NodePort(name="clip", type="CLIP"),
                 NodePort(name="model", type="MODEL"),
                 NodePort(
-                    name="source_latent",
+                    name="refer_latent",
                     type="LATENT",
                     required=False,
-                    description="Source audio latent (required for cover tasks).",
-                ),
-                NodePort(
-                    name="semantic_hints",
-                    type="SEMANTIC_HINTS",
-                    required=False,
-                    description="Pre-extracted semantic hints.",
-                ),
-                NodePort(
-                    name="refer_audio",
-                    type="AUDIO",
-                    required=False,
-                    description="Reference audio for timbre (uses source latent if not provided).",
+                    description="Timbre reference latent. Defaults to silence.",
                 ),
             ),
             outputs=(
@@ -80,23 +72,20 @@ class TextEncode(BaseNode):
         device = handler.device
         dtype = handler.dtype
 
-        source_latent: Optional[Latent] = kwargs.get("source_latent")
-        semantic_hints: Optional[SemanticHints] = kwargs.get("semantic_hints")
-        refer_audio: Optional[Audio] = kwargs.get("refer_audio")
+        refer_latent: Optional[Latent] = kwargs.get("refer_latent")
 
         tags = kwargs.get("tags", "")
         lyrics = kwargs.get("lyrics", "")
-        task = kwargs.get("task", "generate")
+        instruction = kwargs.get(
+            "instruction", TASK_INSTRUCTIONS["text2music"]
+        )
         bpm = kwargs.get("bpm", 120)
         duration = kwargs.get("duration", 60.0)
         key = kwargs.get("key", "C major")
         time_signature = kwargs.get("time_signature", "4")
         language = kwargs.get("language", "en")
 
-        is_cover = task in ("cover", "edit", "repaint")
-
-        # --- Build text prompt (matches test script format) ---
-        instruction = "Generate audio semantic tokens based on the given conditions:"
+        # --- Build text prompt ---
         meta_cap = (
             f"- bpm: {bpm}\n"
             f"- timesignature: {time_signature}\n"
@@ -136,70 +125,32 @@ class TextEncode(BaseNode):
                 lyric_hidden.shape[:2], device=device, dtype=torch.bool
             )
 
-        # --- Source latents ---
-        if source_latent is not None:
-            src_lat = source_latent.tensor.to(device=device, dtype=dtype)
+        # --- Timbre reference ---
+        if refer_latent is not None:
+            refer_packed = refer_latent.tensor.to(device=device, dtype=dtype)
+            refer_order_mask = torch.zeros(1, device=device, dtype=torch.long)
         else:
-            # Generate from silence
             handler._ensure_silence_latent_on_device()
-            T = int(duration * 25)  # 25 fps latent rate
-            silence = handler.silence_latent  # [1, T_full, D]
-            if silence.dim() == 3:
-                src_lat = silence[:, :T, :].clone().to(device=device, dtype=dtype)
-            else:
-                src_lat = (
-                    silence.unsqueeze(0).expand(1, T, -1)
-                    .clone().to(device=device, dtype=dtype)
-                )
-
-        T = src_lat.shape[1]
-        D = src_lat.shape[2]
-
-        # --- Reference audio (timbre) ---
-        if refer_audio is not None:
-            with handler._load_model_context("vae"):
-                refer_packed, refer_order_mask = handler.encode_reference_from_audio(
-                    refer_audio.waveform[0]
-                    if refer_audio.waveform.dim() == 3
-                    else refer_audio.waveform
-                )
-        else:
-            # Default: use source latent as reference (matches test scripts)
-            refer_packed = src_lat.clone()
+            refer_packed = handler.silence_latent[:, :750, :].to(
+                device=device, dtype=dtype
+            )
             refer_order_mask = torch.zeros(1, device=device, dtype=torch.long)
 
-        # --- Semantic hints ---
-        precomputed_hints = None
-        if semantic_hints is not None:
-            precomputed_hints = semantic_hints.tensor.to(device=device, dtype=dtype)
-
-        # --- Build condition via model.prepare_condition ---
-        chunk_masks = torch.ones(1, T, D, device=device, dtype=dtype)
-        is_covers = torch.tensor([is_cover], dtype=torch.bool, device=device)
-        handler._ensure_silence_latent_on_device()
-
+        # --- Encode via model.encoder ---
         with handler._load_model_context("model"):
-            enc_hidden, enc_mask, context_latents = handler.model.prepare_condition(
+            enc_hidden, enc_mask = handler.model.encoder(
                 text_hidden_states=text_hidden.to(dtype),
                 text_attention_mask=text_mask,
                 lyric_hidden_states=lyric_hidden.to(dtype),
                 lyric_attention_mask=lyric_mask,
-                refer_audio_acoustic_hidden_states_packed=refer_packed.to(device),
+                refer_audio_acoustic_hidden_states_packed=refer_packed,
                 refer_audio_order_mask=refer_order_mask,
-                hidden_states=src_lat,
-                attention_mask=torch.ones(1, T, device=device, dtype=dtype),
-                silence_latent=handler.silence_latent,
-                src_latents=src_lat,
-                chunk_masks=chunk_masks,
-                is_covers=is_covers,
-                precomputed_lm_hints_25Hz=precomputed_hints,
             )
 
         return {
             "conditioning": Conditioning(
                 encoder_hidden_states=enc_hidden,
                 encoder_attention_mask=enc_mask,
-                context_latents=context_latents,
             )
         }
 
@@ -240,7 +191,6 @@ class ConditioningZeroOut(BaseNode):
             "conditioning": Conditioning(
                 encoder_hidden_states=torch.zeros_like(entry.encoder_hidden_states),
                 encoder_attention_mask=entry.encoder_attention_mask,
-                context_latents=entry.context_latents,
             )
         }
 
@@ -249,8 +199,7 @@ class ConditioningZeroOut(BaseNode):
 class ConditioningAverage(BaseNode):
     """Blend two conditionings by weighted average.
 
-    Produces a single fused conditioning by interpolating the
-    encoder hidden states and context latents. Attention mask
+    Interpolates the encoder hidden states. Attention mask
     is taken from conditioning_a.
 
     Node parameters:
@@ -290,7 +239,7 @@ class ConditioningAverage(BaseNode):
 
         w = float(weight)
 
-        # Match encoder_hidden_states lengths (ComfyUI truncates/pads B to A's length)
+        # Match encoder_hidden_states lengths
         enc_a = a.encoder_hidden_states
         enc_b = b.encoder_hidden_states
         len_a = enc_a.shape[1]
@@ -301,13 +250,11 @@ class ConditioningAverage(BaseNode):
             enc_b = torch.nn.functional.pad(enc_b, (0, 0, 0, len_a - len_b))
 
         blended_enc = (1.0 - w) * enc_a + w * enc_b
-        blended_ctx = (1.0 - w) * a.context_latents + w * b.context_latents
 
         return {
             "conditioning": Conditioning(
                 encoder_hidden_states=blended_enc,
                 encoder_attention_mask=a.encoder_attention_mask,
-                context_latents=blended_ctx,
             )
         }
 
@@ -369,7 +316,6 @@ class ConditioningCombine(BaseNode):
         temporal_weight_b = None
         temporal_weight_a = None
         if temporal_mask is not None:
-            # Move to same device as conditioning tensors
             ref = entries_b[0].encoder_hidden_states if entries_b else (
                 entries_a[0].encoder_hidden_states if entries_a else None
             )
@@ -377,17 +323,14 @@ class ConditioningCombine(BaseNode):
                 temporal_weight_b = temporal_mask.tensor.to(device=ref.device, dtype=ref.dtype)
             else:
                 temporal_weight_b = temporal_mask.tensor
-            # Complementary weight for A: crossfade so weights sum to 1.0
             temporal_weight_a = 1.0 - temporal_weight_b
 
-        # A entries get complementary temporal weight
         combined = []
         for entry in entries_a:
             combined.append(
                 ConditioningEntry(
                     encoder_hidden_states=entry.encoder_hidden_states,
                     encoder_attention_mask=entry.encoder_attention_mask,
-                    context_latents=entry.context_latents,
                     temporal_weight=temporal_weight_a,
                     step_range=entry.step_range,
                     hook_ref=entry.hook_ref,
@@ -399,7 +342,6 @@ class ConditioningCombine(BaseNode):
                 ConditioningEntry(
                     encoder_hidden_states=entry.encoder_hidden_states,
                     encoder_attention_mask=entry.encoder_attention_mask,
-                    context_latents=entry.context_latents,
                     temporal_weight=temporal_weight_b,
                     step_range=step_range,
                     hook_ref=entry.hook_ref,

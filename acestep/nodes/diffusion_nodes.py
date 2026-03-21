@@ -14,6 +14,7 @@ from .types import (
     Config,
     Curve,
     Latent,
+    Mask,
     ModelHandle,
 )
 
@@ -64,9 +65,8 @@ class DiffusionConfigNode(BaseNode):
 class Generate(BaseNode):
     """Run the diffusion generation loop.
 
-    This is the central node. It takes a model, conditioning, config,
-    and optional modulation curves, builds the ConditionSet, and runs
-    DiffusionEngine.generate().
+    Builds context_latents from context_latent + chunk_mask, then
+    runs DiffusionEngine.generate().
 
     Positive conditioning is required. Negative conditioning is optional
     (for CFG with guidance_scale > 1.0, future base model support).
@@ -91,6 +91,18 @@ class Generate(BaseNode):
                     type="CONDITIONING",
                     required=False,
                     description="Negative conditioning for CFG (optional, ignored at guidance_scale=1.0).",
+                ),
+                NodePort(
+                    name="context_latent",
+                    type="LATENT",
+                    required=False,
+                    description="Structural context for the model (semantic hints for cover, blanked latent for repaint, silence for text2music).",
+                ),
+                NodePort(
+                    name="chunk_mask",
+                    type="MASK",
+                    required=False,
+                    description="Per-frame generation mask. 1.0=generate, 0.0=preserve. Defaults to all ones.",
                 ),
                 NodePort(
                     name="source_latent",
@@ -152,6 +164,8 @@ class Generate(BaseNode):
         positive: Conditioning = kwargs["positive"]
 
         negative: Optional[Conditioning] = kwargs.get("negative")
+        context_latent: Optional[Latent] = kwargs.get("context_latent")
+        chunk_mask_input: Optional[Mask] = kwargs.get("chunk_mask")
         source_latent: Optional[Latent] = kwargs.get("source_latent")
         velocity_scale: Optional[Curve] = kwargs.get("velocity_scale")
         sde_denoise_curve: Optional[Curve] = kwargs.get("sde_denoise_curve")
@@ -163,15 +177,43 @@ class Generate(BaseNode):
 
         handler = model_handle.handler
         config = config_payload.config
+        device = handler.device
+        dtype = handler.dtype
 
-        # Build PreparedConditions from the Conditioning payload
+        # --- Build context_latents from context_latent + chunk_mask ---
+        if context_latent is not None:
+            ctx_lat = context_latent.tensor.to(device=device, dtype=dtype)
+        else:
+            # Default to silence
+            handler._ensure_silence_latent_on_device()
+            duration = kwargs.get("duration", 60.0)
+            T = int(duration * 25)
+            ctx_lat = handler.silence_latent[:, :T, :].clone().to(
+                device=device, dtype=dtype
+            )
+
+        T = ctx_lat.shape[1]
+        D = ctx_lat.shape[2]
+
+        if chunk_mask_input is not None:
+            cm = chunk_mask_input.tensor.to(device=device, dtype=dtype)
+            if cm.ndim == 1:
+                cm = cm.unsqueeze(0).unsqueeze(-1).expand(1, T, D)
+            elif cm.ndim == 2:
+                cm = cm.unsqueeze(-1).expand(-1, T, D)
+        else:
+            cm = torch.ones(1, T, D, device=device, dtype=dtype)
+
+        context_latents = torch.cat([ctx_lat, cm], dim=-1)
+
+        # --- Build PreparedConditions from the Conditioning payload ---
         conditions = []
         for entry in positive.to_entries():
             conditions.append(
                 PreparedCondition(
                     encoder_hidden_states=entry.encoder_hidden_states,
                     encoder_attention_mask=entry.encoder_attention_mask,
-                    context_latents=entry.context_latents,
+                    context_latents=context_latents,
                     temporal_weight=entry.temporal_weight,
                     step_range=entry.step_range,
                     hook_ref=entry.hook_ref,
@@ -185,7 +227,7 @@ class Generate(BaseNode):
             guidance_scale=guidance_scale,
         )
 
-        # Extract source latents and mask
+        # Extract source latents and mask (for denoise < 1.0)
         source_latents = None
         latent_mask = None
         if source_latent is not None:
@@ -201,7 +243,7 @@ class Generate(BaseNode):
                     PreparedCondition(
                         encoder_hidden_states=entry.encoder_hidden_states,
                         encoder_attention_mask=entry.encoder_attention_mask,
-                        context_latents=entry.context_latents,
+                        context_latents=context_latents,
                         temporal_weight=entry.temporal_weight,
                         step_range=entry.step_range,
                         hook_ref=entry.hook_ref,
@@ -210,8 +252,6 @@ class Generate(BaseNode):
             negative_condition_set = ConditionSet(conditions=neg_conditions)
 
         # Build engine kwargs for optional curves (move to model device)
-        device = handler.device
-        dtype = handler.dtype
         engine_kwargs: dict[str, Any] = {}
         if velocity_scale is not None:
             engine_kwargs["velocity_scale"] = velocity_scale.tensor.to(device=device, dtype=dtype)

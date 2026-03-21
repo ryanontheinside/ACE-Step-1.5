@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Basic cover workflow using the node system.
 
-Replaces test_denoise_75.py. Demonstrates:
+Demonstrates:
   - LoadModel -> MODEL, CLIP, VAE
   - LoadAudio -> VAEEncode -> LATENT (source)
-  - SemanticExtract -> SEMANTIC_HINTS
-  - TextEncode -> CONDITIONING
+  - SemanticExtract -> SemanticHintsToLatent -> LATENT (context)
+  - TextEncode (with refer_latent for timbre) -> CONDITIONING
   - DiffusionConfig -> CONFIG
-  - Generate -> LATENT (output)
+  - Generate (context_latent + source_latent) -> LATENT (output)
   - VAEDecode -> AUDIO
 """
 
@@ -32,8 +32,9 @@ from acestep.nodes import (
 from acestep.nodes.model_nodes import LoadModel
 from acestep.nodes.vae_nodes import VAEEncodeAudio, VAEDecodeAudio
 from acestep.nodes.cond_nodes import TextEncode
-from acestep.nodes.semantic_nodes import SemanticExtract
+from acestep.nodes.semantic_nodes import SemanticExtract, SemanticHintsToLatent
 from acestep.nodes.diffusion_nodes import DiffusionConfigNode, Generate
+from acestep.constants import TASK_INSTRUCTIONS
 
 SOURCE_AUDIO = os.path.join(project_root, "test_audio", "new_order_confusion_60seconds.wav")
 OUTPUT_DIR = os.path.join(project_root, "test_output", "workflows")
@@ -92,29 +93,28 @@ def main():
     source_latent = VAEEncodeAudio().execute(vae=vae, audio=source_audio)["latent"]
     print(f"  Latent: {list(source_latent.tensor.shape)} ({time.time() - t0:.2f}s)")
 
-    # --- Semantic Extract ---
-    print("\n[SemanticExtract]")
+    # --- Semantic Extract -> Latent (structural context for cover) ---
+    print("\n[SemanticExtract + SemanticHintsToLatent]")
     t0 = time.time()
     hints = SemanticExtract().execute(model=model, latent=source_latent)["semantic_hints"]
-    print(f"  Hints: {list(hints.tensor.shape)} ({time.time() - t0:.2f}s)")
+    context_latent = SemanticHintsToLatent().execute(semantic_hints=hints)["latent"]
+    print(f"  Context latent: {list(context_latent.tensor.shape)} ({time.time() - t0:.2f}s)")
 
-    # --- Text Encode ---
+    # --- Text Encode (cross-attention conditioning) ---
     print("\n[TextEncode]")
     t0 = time.time()
     conditioning = TextEncode().execute(
         clip=clip,
         model=model,
-        source_latent=source_latent,
-        semantic_hints=hints,
+        refer_latent=source_latent,
         tags="deathstep death deaht deaht",
         lyrics="",
-        task="cover",
+        instruction=TASK_INSTRUCTIONS["cover"],
         bpm=136,
         duration=60.0,
         key="G# minor",
         time_signature="4",
         language="en",
-        seed=0,
     )["conditioning"]
     print(f"  Conditioning encoded ({time.time() - t0:.2f}s)")
 
@@ -134,6 +134,7 @@ def main():
             model=model,
             config=config,
             positive=conditioning,
+            context_latent=context_latent,
             source_latent=source_latent,
         )["latent"]
         print(f"  Generated: {list(output_latent.tensor.shape)} ({time.time() - t0:.2f}s)")

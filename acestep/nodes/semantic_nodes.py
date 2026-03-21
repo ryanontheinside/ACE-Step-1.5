@@ -101,3 +101,34 @@ class SemanticBlend(BaseNode):
 
         blended = blend_semantic_hints(hints_a.tensor, hints_b.tensor, alpha)
         return {"semantic_hints": SemanticHints(tensor=blended)}
+
+
+@NodeRegistry.register
+class SemanticHintsToLatent(BaseNode):
+    """Convert semantic hints to a latent for use as context_latent.
+
+    Semantic hints and latents share the same [B, T, D] shape.
+    This node bridges the type system so hints can be wired into
+    Generate's context_latent input.
+    """
+
+    node_type_id: ClassVar[str] = "acestep.SemanticHintsToLatent"
+
+    @classmethod
+    def get_definition(cls) -> NodeDefinition:
+        return NodeDefinition(
+            node_type_id=cls.node_type_id,
+            display_name="Semantic Hints → Latent",
+            category="semantic",
+            description="Convert semantic hints to latent type.",
+            inputs=(
+                NodePort(name="semantic_hints", type="SEMANTIC_HINTS"),
+            ),
+            outputs=(
+                NodePort(name="latent", type="LATENT"),
+            ),
+        )
+
+    def execute(self, **kwargs: Any) -> dict[str, Any]:
+        hints: SemanticHints = kwargs["semantic_hints"]
+        return {"latent": Latent(tensor=hints.tensor)}
