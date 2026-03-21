@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """Build VAE TensorRT engines from scratch.
 
-This script is the single reproducible entry point for TRT engine creation.
+This is the single reproducible entry point for TRT engine creation.
 It loads the ACE-Step model, exports VAE ONNX files, and builds TRT engines.
 The DiT decoder uses torch.compile (faster than TRT for this model).
 
 Usage:
-    python scripts/build_trt_engines.py
+    python -m acestep.engine.trt.build
 
     # Custom output directory:
-    python scripts/build_trt_engines.py --output-dir trt_engines
+    python -m acestep.engine.trt.build --output-dir trt_engines
 
     # Skip ONNX export (reuse existing):
-    python scripts/build_trt_engines.py --skip-onnx
+    python -m acestep.engine.trt.build --skip-onnx
 
     # Custom max duration (default 4 minutes):
-    python scripts/build_trt_engines.py --max-duration 600
+    python -m acestep.engine.trt.build --max-duration 600
 
 Requirements:
     - tensorrt-cu12 (uv pip install tensorrt-cu12)
@@ -37,18 +37,26 @@ def _patch(name, *a, **k):
     return _orig(name, *a, **k)
 importlib.util.find_spec = _patch
 
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
-
 import torch
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 
+def _find_project_root() -> str:
+    """Walk up from this file to find the project root (contains checkpoints/)."""
+    d = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(10):
+        if os.path.isdir(os.path.join(d, "checkpoints")):
+            return d
+        d = os.path.dirname(d)
+    return os.getcwd()
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Build ACE-Step TRT engines")
+    project_root = _find_project_root()
+
+    parser = argparse.ArgumentParser(description="Build ACE-Step VAE TRT engines")
     parser.add_argument("--output-dir", default=os.path.join(project_root, "trt_engines"),
                         help="Directory for ONNX and engine files")
     parser.add_argument("--checkpoint", default="acestep-v15-turbo",
@@ -78,6 +86,10 @@ def main():
     # Step 1: Load model
     # ================================================================
     logger.info("Loading model from checkpoints/%s...", args.checkpoint)
+
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
     from acestep.handler import AceStepHandler
 
     handler = AceStepHandler()
@@ -98,9 +110,7 @@ def main():
         logger.info("ONNX EXPORT")
         logger.info("=" * 60)
 
-        # VAE encoder
-        logger.info("Exporting VAE encoder...")
-        from acestep.engine.trt.vae_export import (
+        from .vae_export import (
             export_vae_encoder_onnx,
             export_vae_decoder_onnx,
             VAEExportConfig,
@@ -114,7 +124,6 @@ def main():
             )
             logger.info("VAE encoder exported in %.1fs", time.time() - t0)
 
-            # VAE decoder
             logger.info("Exporting VAE decoder...")
             t0 = time.time()
             export_vae_decoder_onnx(
@@ -143,7 +152,7 @@ def main():
                 args.max_duration, max_latent_frames)
     logger.info("=" * 60)
 
-    from acestep.engine.trt.vae_export import (
+    from .vae_export import (
         build_vae_decode_engine,
         build_vae_encode_engine,
         VAETRTBuildConfig,
@@ -155,13 +164,11 @@ def main():
         encode_max_samples=max_audio_samples,
     )
 
-    # VAE decoder
     logger.info("Building VAE decode engine...")
     t0 = time.time()
     build_vae_decode_engine(vae_dec_onnx, vae_dec_engine, config=vae_config)
     logger.info("VAE decode engine built in %.0fs", time.time() - t0)
 
-    # VAE encoder
     logger.info("Building VAE encode engine...")
     t0 = time.time()
     build_vae_encode_engine(vae_enc_onnx, vae_enc_engine, config=vae_config)
