@@ -114,8 +114,15 @@ def _trt_vae_encode(
 
 
 def _find_trt_engine(name: str) -> Optional[str]:
-    """Search for a TRT engine file in common locations."""
+    """Search for a TRT engine file in common locations.
+
+    Checks trt_engines_local first (build script output), then trt_engines
+    (symlinked or manually placed). Searches both CWD-relative and
+    package-relative paths.
+    """
     candidates = [
+        os.path.join("trt_engines_local", name),
+        os.path.join(os.path.dirname(__file__), "..", "..", "trt_engines_local", name),
         os.path.join("trt_engines", name),
         os.path.join(os.path.dirname(__file__), "..", "..", "trt_engines", name),
     ]
