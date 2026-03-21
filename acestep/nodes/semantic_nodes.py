@@ -95,7 +95,9 @@ class SemanticBlend(BaseNode):
 
         alpha = kwargs.get("alpha", 0.5)
         if blend_curve is not None:
-            alpha = blend_curve.tensor
+            alpha = blend_curve.tensor.to(
+                device=hints_a.tensor.device, dtype=hints_a.tensor.dtype
+            )
 
         blended = blend_semantic_hints(hints_a.tensor, hints_b.tensor, alpha)
         return {"semantic_hints": SemanticHints(tensor=blended)}

@@ -143,13 +143,14 @@ class TextEncode(BaseNode):
             # Generate from silence
             handler._ensure_silence_latent_on_device()
             T = int(duration * 25)  # 25 fps latent rate
-            src_lat = (
-                handler.silence_latent
-                .unsqueeze(0)
-                .expand(1, T, -1)
-                .clone()
-                .to(device=device, dtype=dtype)
-            )
+            silence = handler.silence_latent  # [1, T_full, D]
+            if silence.dim() == 3:
+                src_lat = silence[:, :T, :].clone().to(device=device, dtype=dtype)
+            else:
+                src_lat = (
+                    silence.unsqueeze(0).expand(1, T, -1)
+                    .clone().to(device=device, dtype=dtype)
+                )
 
         T = src_lat.shape[1]
         D = src_lat.shape[2]
@@ -288,7 +289,18 @@ class ConditioningAverage(BaseNode):
         b = entries_b[0]
 
         w = float(weight)
-        blended_enc = (1.0 - w) * a.encoder_hidden_states + w * b.encoder_hidden_states
+
+        # Match encoder_hidden_states lengths (ComfyUI truncates/pads B to A's length)
+        enc_a = a.encoder_hidden_states
+        enc_b = b.encoder_hidden_states
+        len_a = enc_a.shape[1]
+        len_b = enc_b.shape[1]
+        if len_b > len_a:
+            enc_b = enc_b[:, :len_a]
+        elif len_b < len_a:
+            enc_b = torch.nn.functional.pad(enc_b, (0, 0, 0, len_a - len_b))
+
+        blended_enc = (1.0 - w) * enc_a + w * enc_b
         blended_ctx = (1.0 - w) * a.context_latents + w * b.context_latents
 
         return {
@@ -349,17 +361,38 @@ class ConditioningCombine(BaseNode):
         entries_a = cond_a.to_entries()
         entries_b = cond_b.to_entries()
 
-        # A entries have no compositing metadata (uniform weight)
-        combined = list(entries_a)
-
         # B entries get compositing metadata
         step_range = None
         if step_start is not None and step_end is not None:
             step_range = (float(step_start), float(step_end))
 
-        temporal_weight = None
+        temporal_weight_b = None
+        temporal_weight_a = None
         if temporal_mask is not None:
-            temporal_weight = temporal_mask.tensor
+            # Move to same device as conditioning tensors
+            ref = entries_b[0].encoder_hidden_states if entries_b else (
+                entries_a[0].encoder_hidden_states if entries_a else None
+            )
+            if ref is not None:
+                temporal_weight_b = temporal_mask.tensor.to(device=ref.device, dtype=ref.dtype)
+            else:
+                temporal_weight_b = temporal_mask.tensor
+            # Complementary weight for A: crossfade so weights sum to 1.0
+            temporal_weight_a = 1.0 - temporal_weight_b
+
+        # A entries get complementary temporal weight
+        combined = []
+        for entry in entries_a:
+            combined.append(
+                ConditioningEntry(
+                    encoder_hidden_states=entry.encoder_hidden_states,
+                    encoder_attention_mask=entry.encoder_attention_mask,
+                    context_latents=entry.context_latents,
+                    temporal_weight=temporal_weight_a,
+                    step_range=entry.step_range,
+                    hook_ref=entry.hook_ref,
+                )
+            )
 
         for entry in entries_b:
             combined.append(
@@ -367,7 +400,7 @@ class ConditioningCombine(BaseNode):
                     encoder_hidden_states=entry.encoder_hidden_states,
                     encoder_attention_mask=entry.encoder_attention_mask,
                     context_latents=entry.context_latents,
-                    temporal_weight=temporal_weight,
+                    temporal_weight=temporal_weight_b,
                     step_range=step_range,
                     hook_ref=entry.hook_ref,
                 )

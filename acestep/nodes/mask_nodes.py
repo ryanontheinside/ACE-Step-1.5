@@ -99,7 +99,7 @@ class SetLatentNoiseMask(BaseNode):
         mask: Mask = kwargs["mask"]
 
         noise_mask = LatentNoiseMask(
-            mask=mask.tensor,
+            mask=mask.tensor.to(device=latent.tensor.device, dtype=latent.tensor.dtype),
             original_latents=latent.tensor,
         )
 

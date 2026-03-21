@@ -96,6 +96,8 @@ class DiffusionEngine:
         sde_denoise_curve: Optional[torch.Tensor],
         x0_target: Optional[torch.Tensor],
         apply_hooks_fn: Optional[Callable],
+        negative_condition_set: Optional[ConditionSet] = None,
+        ode_noise_curve: Optional[torch.Tensor] = None,
     ) -> bool:
         """Check if the precomputed fast path is viable."""
         if config.infer_method != "ode":
@@ -109,6 +111,10 @@ class DiffusionEngine:
         if apply_hooks_fn is not None:
             return False
         if not condition_set.is_single_condition:
+            return False
+        if negative_condition_set is not None:
+            return False
+        if ode_noise_curve is not None:
             return False
         return True
 
@@ -623,6 +629,9 @@ class DiffusionEngine:
         initial_noise_curve: Optional[torch.Tensor] = None,
         x0_target: Optional[torch.Tensor] = None,
         x0_target_curve: Optional[torch.Tensor] = None,
+        negative_condition_set: Optional[ConditionSet] = None,
+        guidance_curve: Optional[torch.Tensor] = None,
+        ode_noise_curve: Optional[torch.Tensor] = None,
     ) -> dict:
         """Run the diffusion loop.
 
@@ -666,6 +675,18 @@ class DiffusionEngine:
                 Required when x0_target is set. Blending is gated to
                 the second half of diffusion steps (refinement phase)
                 to avoid corrupting structural decisions.
+            negative_condition_set: Optional negative (unconditional)
+                conditions for classifier-free guidance. Used with
+                guidance_curve for per-frame CFG.
+            guidance_curve: Per-frame guidance scale. Shape [T], [B, T],
+                or [B, T, 1]. Applied as:
+                v = v_uncond + guidance * (v_cond - v_uncond).
+                Requires negative_condition_set.
+            ode_noise_curve: Per-frame noise injection after each ODE
+                step (not final step). Shape [T], [B, T], or [B, T, 1].
+                Injection is scaled by current sigma so it naturally
+                decreases toward clean. Creates controlled creativity
+                at specified frames.
 
         Returns:
             Dict with ``target_latents`` [B, T, D] and ``time_costs``.
@@ -704,6 +725,7 @@ class DiffusionEngine:
         if self._can_use_fast_path(
             condition_set, config, latent_mask,
             velocity_scale, sde_denoise_curve, x0_target, apply_hooks_fn,
+            negative_condition_set, ode_noise_curve,
         ) and initial_noise_curve is None:
             diffusion_start = time.time()
             xt = self._generate_fast(
@@ -805,6 +827,25 @@ class DiffusionEngine:
                     if config.use_cache else None
                 )
 
+            # --- Per-frame classifier-free guidance ---
+            if negative_condition_set is not None and guidance_curve is not None:
+                neg_active = negative_condition_set.active_conditions_at_step(
+                    step_idx, infer_steps
+                )
+                if not neg_active:
+                    neg_active = [negative_condition_set.conditions[0]]
+                if len(neg_active) == 1 and neg_active[0].temporal_weight is None:
+                    vt_uncond, _ = self._single_condition_step(
+                        xt_input, t_curr_tensor, neg_active[0], attention_mask,
+                        use_cache=False, past_key_values=None,
+                    )
+                else:
+                    vt_uncond = self._multi_condition_step(
+                        xt_input, t_curr_tensor, neg_active, attention_mask,
+                    )
+                gc = self._normalize_curve(guidance_curve)
+                vt = vt_uncond + gc * (vt - vt_uncond)
+
             # --- Per-frame velocity scaling ---
             if velocity_scale is not None:
                 vt = vt * self._normalize_curve(velocity_scale)
@@ -832,6 +873,16 @@ class DiffusionEngine:
                 x0_target=x0_target_effective,
                 x0_target_curve=x0_target_curve_effective,
             )
+
+            # --- Per-frame ODE noise injection (skip final step) ---
+            if (
+                ode_noise_curve is not None
+                and step_idx < infer_steps - 1
+                and t_next > 0
+            ):
+                injection_noise = torch.randn_like(xt)
+                ode_curve = self._normalize_curve(ode_noise_curve)
+                xt = xt + injection_noise * ode_curve * t_next
 
         diffusion_end = time.time()
         time_costs["diffusion_time_cost"] = diffusion_end - diffusion_start

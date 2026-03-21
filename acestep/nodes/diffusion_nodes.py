@@ -128,6 +128,18 @@ class Generate(BaseNode):
                     required=False,
                     description="Per-frame blend strength toward x0 target.",
                 ),
+                NodePort(
+                    name="guidance_curve",
+                    type="CURVE",
+                    required=False,
+                    description="Per-frame CFG guidance scale (requires negative conditioning).",
+                ),
+                NodePort(
+                    name="ode_noise_curve",
+                    type="CURVE",
+                    required=False,
+                    description="Per-frame ODE noise injection curve (skipped on final step).",
+                ),
             ),
             outputs=(
                 NodePort(name="latent", type="LATENT"),
@@ -146,6 +158,8 @@ class Generate(BaseNode):
         initial_noise_curve: Optional[Curve] = kwargs.get("initial_noise_curve")
         x0_target: Optional[Latent] = kwargs.get("x0_target")
         x0_target_curve: Optional[Curve] = kwargs.get("x0_target_curve")
+        guidance_curve_input: Optional[Curve] = kwargs.get("guidance_curve")
+        ode_noise_curve: Optional[Curve] = kwargs.get("ode_noise_curve")
 
         handler = model_handle.handler
         config = config_payload.config
@@ -178,18 +192,50 @@ class Generate(BaseNode):
             source_latents = source_latent.tensor
             latent_mask = source_latent.mask
 
-        # Build engine kwargs for optional curves
+        # Build negative condition set for CFG
+        negative_condition_set = None
+        if negative is not None and guidance_curve_input is not None:
+            neg_conditions = []
+            for entry in negative.to_entries():
+                neg_conditions.append(
+                    PreparedCondition(
+                        encoder_hidden_states=entry.encoder_hidden_states,
+                        encoder_attention_mask=entry.encoder_attention_mask,
+                        context_latents=entry.context_latents,
+                        temporal_weight=entry.temporal_weight,
+                        step_range=entry.step_range,
+                        hook_ref=entry.hook_ref,
+                    )
+                )
+            negative_condition_set = ConditionSet(conditions=neg_conditions)
+
+        # Build engine kwargs for optional curves (move to model device)
+        device = handler.device
+        dtype = handler.dtype
         engine_kwargs: dict[str, Any] = {}
         if velocity_scale is not None:
-            engine_kwargs["velocity_scale"] = velocity_scale.tensor
+            engine_kwargs["velocity_scale"] = velocity_scale.tensor.to(device=device, dtype=dtype)
         if sde_denoise_curve is not None:
-            engine_kwargs["sde_denoise_curve"] = sde_denoise_curve.tensor
+            engine_kwargs["sde_denoise_curve"] = sde_denoise_curve.tensor.to(device=device, dtype=dtype)
         if initial_noise_curve is not None:
-            engine_kwargs["initial_noise_curve"] = initial_noise_curve.tensor
+            engine_kwargs["initial_noise_curve"] = initial_noise_curve.tensor.to(device=device, dtype=dtype)
         if x0_target is not None:
-            engine_kwargs["x0_target"] = x0_target.tensor
+            engine_kwargs["x0_target"] = x0_target.tensor.to(device=device, dtype=dtype)
         if x0_target_curve is not None:
-            engine_kwargs["x0_target_curve"] = x0_target_curve.tensor
+            engine_kwargs["x0_target_curve"] = x0_target_curve.tensor.to(device=device, dtype=dtype)
+        if negative_condition_set is not None:
+            engine_kwargs["negative_condition_set"] = negative_condition_set
+        if guidance_curve_input is not None:
+            engine_kwargs["guidance_curve"] = guidance_curve_input.tensor.to(device=device, dtype=dtype)
+        if ode_noise_curve is not None:
+            engine_kwargs["ode_noise_curve"] = ode_noise_curve.tensor.to(device=device, dtype=dtype)
+
+        # When LoRA is active, bypass the compiled fast path.
+        # torch.compile can produce different numerical results in bf16,
+        # and LoRA-modified weights amplify these differences.
+        apply_hooks_fn = None
+        if getattr(handler, '_active_lora_deltas', None):
+            apply_hooks_fn = lambda _: None
 
         # Run the engine
         result = handler.engine_generate(
@@ -197,6 +243,7 @@ class Generate(BaseNode):
             config=config,
             latent_mask=latent_mask,
             source_latents=source_latents,
+            apply_hooks_fn=apply_hooks_fn,
             **engine_kwargs,
         )
 

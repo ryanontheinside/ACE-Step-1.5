@@ -2,8 +2,8 @@
 """Multi-prompt temporal blending workflow.
 
 Replaces test_temporal_blend.py. Demonstrates:
-  - Two TextEncode calls with different prompts
-  - CurveWave -> temporal_weight for per-frame blending
+  - Source audio cover with two different text prompts
+  - CurveWave -> temporal_weight for per-frame crossfade
   - ConditioningCombine to produce multi-condition set
   - Generate runs separate decoder calls, blends velocities per-frame
 """
@@ -15,14 +15,15 @@ import time
 import soundfile as sf
 import torch
 
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from acestep.nodes import Audio, Mask
 from acestep.nodes.model_nodes import LoadModel
-from acestep.nodes.vae_nodes import VAEEncodeAudio, VAEDecodeAudio, EmptyLatent
+from acestep.nodes.vae_nodes import VAEEncodeAudio, VAEDecodeAudio
 from acestep.nodes.cond_nodes import TextEncode, ConditioningCombine
+from acestep.nodes.semantic_nodes import SemanticExtract
 from acestep.nodes.curve_nodes import CurveWave
 from acestep.nodes.diffusion_nodes import DiffusionConfigNode, Generate
 
@@ -50,7 +51,7 @@ def save_audio(audio: Audio, path: str) -> None:
 
 def main():
     print("=" * 70)
-    print("WORKFLOW: Multi-Prompt Temporal Blend")
+    print("WORKFLOW: Multi-Prompt Temporal Blend (cover)")
     print("=" * 70)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -63,33 +64,39 @@ def main():
     )
     model, clip, vae = handles["model"], handles["clip"], handles["vae"]
 
-    # --- Create empty latent (pure generation, no source) ---
-    empty = EmptyLatent().execute(model=model, duration=60.0)["latent"]
-    T = empty.tensor.shape[1]
+    # --- Encode source audio ---
+    source_audio = load_audio(SOURCE_AUDIO)
+    source_latent = VAEEncodeAudio().execute(vae=vae, audio=source_audio)["latent"]
+    T = source_latent.tensor.shape[1]
+    hints = SemanticExtract().execute(model=model, latent=source_latent)["semantic_hints"]
 
-    # --- Encode two different prompts ---
+    # --- Encode two different prompts (both as covers of the source) ---
     print("\n[TextEncode] Prompt A: daft punk style")
     cond_a = TextEncode().execute(
         clip=clip, model=model,
+        source_latent=source_latent,
+        semantic_hints=hints,
         tags="daft punk style electronic french house",
         lyrics="",
-        task="generate",
-        bpm=120, duration=60.0, key="E minor",
+        task="cover",
+        bpm=136, duration=60.0, key="G# minor",
     )["conditioning"]
 
     print("[TextEncode] Prompt B: heavy demon techno")
     cond_b = TextEncode().execute(
         clip=clip, model=model,
+        source_latent=source_latent,
+        semantic_hints=hints,
         tags="heavy demon techno, growling bass, industrial",
         lyrics="",
-        task="generate",
-        bpm=120, duration=60.0, key="E minor",
+        task="cover",
+        bpm=136, duration=60.0, key="G# minor",
     )["conditioning"]
 
     # --- Create temporal blend curve ---
-    # Square wave: alternates between prompt A and prompt B every ~6 seconds
+    # Pulse wave: crossfade between prompt A and prompt B (~6s cycle)
     blend_curve = CurveWave().execute(
-        wave_type="square",
+        wave_type="pulse",
         frames_per_cycle=151,
         amplitude=0.5,
         offset=0.5,
@@ -118,6 +125,7 @@ def main():
         model=model,
         config=config,
         positive=combined,
+        source_latent=source_latent,
     )["latent"]
     print(f"Generated in {time.time() - t0:.2f}s")
 

@@ -272,9 +272,17 @@ class EmptyLatent(BaseNode):
         duration = kwargs.get("duration", 60.0)
 
         handler._ensure_silence_latent_on_device()
-        silence = handler.silence_latent  # [1, D]
+        silence = handler.silence_latent  # [1, T_full, D]
 
         T = int(duration * 25)  # 25 fps latent rate
-        latent = silence.unsqueeze(0).expand(1, T, -1).clone()
+        # Take first T frames from the silence latent (tiled if needed)
+        if silence.dim() == 3:
+            latent = silence[:, :T, :].clone()
+            if latent.shape[1] < T:
+                reps = (T + latent.shape[1] - 1) // latent.shape[1]
+                latent = latent.repeat(1, reps, 1)[:, :T, :]
+        else:
+            # Fallback: treat as [1, D] single frame
+            latent = silence.unsqueeze(0).expand(1, T, -1).clone()
 
         return {"latent": Latent(tensor=latent)}

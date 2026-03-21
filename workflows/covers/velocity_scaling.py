@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Latent noise mask workflow: selective denoising via temporal mask.
+"""Velocity scaling workflow: per-frame transformation rate control.
 
-Replaces parts of test_denoise_curve_B.py. Demonstrates:
-  - CurveWave -> TemporalMask -> SetLatentNoiseMask
-  - Generate with masked latent (two-sided blending)
-  - Regions with mask=0 are preserved, mask=1 are regenerated
+Replaces test_velocity_scaling.py. Demonstrates:
+  - CurveRamp feeding velocity_scale input on Generate
+  - Low values = conservative (preserve source), high = aggressive (transform)
+  - Engine-only feature with no ComfyUI equivalent
 """
 
 import os
@@ -14,7 +14,7 @@ import time
 import soundfile as sf
 import torch
 
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
@@ -23,8 +23,7 @@ from acestep.nodes.model_nodes import LoadModel
 from acestep.nodes.vae_nodes import VAEEncodeAudio, VAEDecodeAudio
 from acestep.nodes.cond_nodes import TextEncode
 from acestep.nodes.semantic_nodes import SemanticExtract
-from acestep.nodes.curve_nodes import CurveWave
-from acestep.nodes.mask_nodes import TemporalMask, SetLatentNoiseMask
+from acestep.nodes.curve_nodes import CurveRamp
 from acestep.nodes.diffusion_nodes import DiffusionConfigNode, Generate
 
 SOURCE_AUDIO = os.path.join(project_root, "test_audio", "new_order_confusion_60seconds.wav")
@@ -51,7 +50,7 @@ def save_audio(audio: Audio, path: str) -> None:
 
 def main():
     print("=" * 70)
-    print("WORKFLOW: Latent Noise Mask (selective denoising)")
+    print("WORKFLOW: Velocity Scaling (per-frame transformation rate)")
     print("=" * 70)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -69,47 +68,28 @@ def main():
     source_latent = VAEEncodeAudio().execute(vae=vae, audio=source_audio)["latent"]
     T = source_latent.tensor.shape[1]
 
-    # --- Create temporal mask from a pulse curve ---
-    # Pulse wave: alternates between preserve (0) and generate (1)
-    mask_curve = CurveWave().execute(
-        wave_type="pulse",
-        frames_per_cycle=300,  # ~12 second cycles
-        amplitude=0.5,
-        offset=0.5,
-        length=T,
-    )["curve"]
-
-    mask = TemporalMask().execute(
-        latent=source_latent,
-        curve=mask_curve,
-    )["mask"]
-
-    # --- Attach mask to latent ---
-    masked_latent = SetLatentNoiseMask().execute(
-        latent=source_latent,
-        mask=mask,
-    )["latent"]
-
-    print(f"Mask shape: {list(mask.tensor.shape)}")
-    print(f"Masked latent has noise mask: {masked_latent.mask is not None}")
-
-    # --- Encode text ---
     hints = SemanticExtract().execute(model=model, latent=source_latent)["semantic_hints"]
 
     conditioning = TextEncode().execute(
-        clip=clip,
-        model=model,
+        clip=clip, model=model,
         source_latent=source_latent,
         semantic_hints=hints,
-        tags="driving techno with insane synths",
+        tags="deathstep death deaht deaht",
         task="cover",
-        bpm=136,
-        duration=60.0,
+        bpm=136, duration=60.0, key="G# minor",
     )["conditioning"]
 
-    # --- Generate with mask ---
+    # --- Create velocity scale curve: gentle start, aggressive end ---
+    vel_curve = CurveRamp().execute(
+        start=0.2,
+        end=1.5,
+        length=T,
+    )["curve"]
+    print(f"Velocity curve: {vel_curve.tensor[0]:.2f} -> {vel_curve.tensor[-1]:.2f}")
+
+    # --- Generate with velocity scaling ---
     config = DiffusionConfigNode().execute(
-        steps=8, shift=3.0, seed=632, denoise=0.85,
+        steps=8, shift=3.0, seed=1528, denoise=1.0,
     )["config"]
 
     t0 = time.time()
@@ -117,13 +97,14 @@ def main():
         model=model,
         config=config,
         positive=conditioning,
-        source_latent=masked_latent,
+        source_latent=source_latent,
+        velocity_scale=vel_curve,
     )["latent"]
     print(f"Generated in {time.time() - t0:.2f}s")
 
     # --- Decode ---
     output_audio = VAEDecodeAudio().execute(vae=vae, latent=output_latent)["audio"]
-    save_audio(output_audio, os.path.join(OUTPUT_DIR, "latent_noise_mask.wav"))
+    save_audio(output_audio, os.path.join(OUTPUT_DIR, "velocity_scaling.wav"))
 
     print("\nDone.")
 
