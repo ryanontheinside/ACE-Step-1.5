@@ -270,12 +270,10 @@ class Generate(BaseNode):
         if ode_noise_curve is not None:
             engine_kwargs["ode_noise_curve"] = ode_noise_curve.tensor.to(device=device, dtype=dtype)
 
-        # When LoRA is active, bypass the compiled fast path.
-        # torch.compile can produce different numerical results in bf16,
-        # and LoRA-modified weights amplify these differences.
+        # apply_hooks_fn is for multi-LoRA-per-condition switching (future).
+        # Pre-applied LoRAs (via ApplyLoRA) modify weights in-place and
+        # work fine with the compiled fast path.
         apply_hooks_fn = None
-        if getattr(handler, '_active_lora_deltas', None):
-            apply_hooks_fn = lambda _: None
 
         # Run the engine
         result = handler.engine_generate(

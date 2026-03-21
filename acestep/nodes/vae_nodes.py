@@ -10,7 +10,7 @@ from typing import Any, ClassVar, Optional
 import torch
 
 from .base import BaseNode, NodeDefinition, NodePort, NodeRegistry
-from .types import Audio, Latent, ModelHandle, VAEHandle
+from .types import Audio, Curve, Latent, ModelHandle, VAEHandle
 
 logger = logging.getLogger(__name__)
 
@@ -282,3 +282,60 @@ class EmptyLatent(BaseNode):
             latent = silence.unsqueeze(0).expand(1, T, -1).clone()
 
         return {"latent": Latent(tensor=latent)}
+
+
+@NodeRegistry.register
+class LatentBlend(BaseNode):
+    """Blend two latents by weighted interpolation.
+
+    Supports scalar or per-frame (CURVE) blend factor.
+    Useful for timbre strength control (blend reference with silence)
+    or mixing any two latent representations.
+
+    Node parameters:
+        alpha: Blend factor (0.0 = all A, 1.0 = all B).
+               Ignored if a blend_curve input is connected.
+    """
+
+    node_type_id: ClassVar[str] = "acestep.LatentBlend"
+
+    @classmethod
+    def get_definition(cls) -> NodeDefinition:
+        return NodeDefinition(
+            node_type_id=cls.node_type_id,
+            display_name="Latent Blend",
+            category="vae",
+            description="Blend two latents with scalar or per-frame factor.",
+            inputs=(
+                NodePort(name="latent_a", type="LATENT"),
+                NodePort(name="latent_b", type="LATENT"),
+                NodePort(
+                    name="blend_curve",
+                    type="CURVE",
+                    required=False,
+                    description="Per-frame blend factor (overrides scalar alpha).",
+                ),
+            ),
+            outputs=(
+                NodePort(name="latent", type="LATENT"),
+            ),
+        )
+
+    def execute(self, **kwargs: Any) -> dict[str, Any]:
+        latent_a: Latent = kwargs["latent_a"]
+        latent_b: Latent = kwargs["latent_b"]
+        blend_curve: Optional[Curve] = kwargs.get("blend_curve")
+
+        a = latent_a.tensor
+        b = latent_b.tensor
+
+        alpha = kwargs.get("alpha", 0.5)
+        if blend_curve is not None:
+            alpha = blend_curve.tensor.to(device=a.device, dtype=a.dtype)
+            if alpha.ndim == 1:
+                alpha = alpha.unsqueeze(0).unsqueeze(-1)  # [1, T, 1]
+            elif alpha.ndim == 2:
+                alpha = alpha.unsqueeze(-1)  # [B, T, 1]
+
+        blended = (1.0 - alpha) * a + alpha * b
+        return {"latent": Latent(tensor=blended)}

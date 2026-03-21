@@ -211,3 +211,66 @@ class Session:
         from acestep.nodes.vae_nodes import VAEDecodeAudio
 
         return VAEDecodeAudio().execute(vae=self.vae, latent=latent)["audio"]
+
+    # ------------------------------------------------------------------
+    # Audio analysis
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def audio_info(audio: Audio) -> dict:
+        """Detect BPM, key, and duration from audio."""
+        from acestep.nodes.audio_nodes import AudioInfo
+
+        return AudioInfo().execute(audio=audio)
+
+    # ------------------------------------------------------------------
+    # Latent / LoRA utilities
+    # ------------------------------------------------------------------
+
+    def empty_latent(self, duration: float = 60.0) -> Latent:
+        """Create a silence latent of a given duration."""
+        from acestep.nodes.vae_nodes import EmptyLatent
+
+        return EmptyLatent().execute(
+            model=self.model, duration=duration,
+        )["latent"]
+
+    @staticmethod
+    def blend_latents(
+        a: Latent, b: Latent, alpha: float = 0.5,
+    ) -> Latent:
+        """Blend two latents. 0.0 = all A, 1.0 = all B."""
+        from acestep.nodes.vae_nodes import LatentBlend
+
+        return LatentBlend().execute(
+            latent_a=a, latent_b=b, alpha=alpha,
+        )["latent"]
+
+    def apply_lora(self, path: str, scale: float = 1.0) -> None:
+        """Load and apply a LoRA. Stackable (call multiple times)."""
+        from acestep.nodes.lora_nodes import LoadLoRA, ApplyLoRA
+
+        lora = LoadLoRA().execute(path=path, scale=scale)["lora"]
+        ApplyLoRA().execute(model=self.model, lora=lora)
+        if not hasattr(self, '_lora_stack'):
+            self._lora_stack = []
+        self._lora_stack.append(lora)
+
+    def remove_loras(self) -> None:
+        """Remove all applied LoRAs in reverse order."""
+        from acestep.nodes.lora_nodes import RemoveLoRA
+
+        if hasattr(self, '_lora_stack'):
+            while self._lora_stack:
+                RemoveLoRA().execute(
+                    model=self.model, lora=self._lora_stack.pop(),
+                )
+
+    def remove_last_lora(self) -> None:
+        """Remove the most recently applied LoRA."""
+        from acestep.nodes.lora_nodes import RemoveLoRA
+
+        if hasattr(self, '_lora_stack') and self._lora_stack:
+            RemoveLoRA().execute(
+                model=self.model, lora=self._lora_stack.pop(),
+            )
