@@ -34,9 +34,9 @@ class VAEEncoderForExport(nn.Module):
         self.vae = vae
 
     def forward(self, audio: torch.Tensor) -> torch.Tensor:
-        # vae.encode returns a distribution object; we want the raw moments
-        dist = self.vae.encode(audio)
-        return dist.parameters  # [B, 128, T] (mean ++ logvar)
+        # vae.encode returns AutoencoderOobleckOutput with .latent_dist
+        out = self.vae.encode(audio)
+        return out.latent_dist.parameters  # [B, 128, T] (mean ++ logvar)
 
 
 class VAEDecoderForExport(nn.Module):
@@ -107,6 +107,7 @@ def export_vae_encoder_onnx(
             },
             opset_version=config.opset_version,
             do_constant_folding=config.do_constant_folding,
+            dynamo=False,
         )
 
     logger.info("VAE encoder ONNX saved to %s", onnx_path)
@@ -152,6 +153,7 @@ def export_vae_decoder_onnx(
             },
             opset_version=config.opset_version,
             do_constant_folding=config.do_constant_folding,
+            dynamo=False,
         )
 
     logger.info("VAE decoder ONNX saved to %s", onnx_path)

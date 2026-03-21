@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Build all TensorRT engines from scratch.
+"""Build VAE TensorRT engines from scratch.
 
 This script is the single reproducible entry point for TRT engine creation.
-It loads the ACE-Step model, exports ONNX files, and builds TRT engines.
+It loads the ACE-Step model, exports VAE ONNX files, and builds TRT engines.
+The DiT decoder uses torch.compile (faster than TRT for this model).
 
 Usage:
     python scripts/build_trt_engines.py
@@ -69,11 +70,9 @@ def main():
     onnx_dir = args.output_dir
     vae_enc_onnx = os.path.join(onnx_dir, "vae_encode.onnx")
     vae_dec_onnx = os.path.join(onnx_dir, "vae_decode.onnx")
-    dec_onnx = os.path.join(onnx_dir, "decoder.onnx")
 
     vae_enc_engine = os.path.join(args.output_dir, "vae_encode_fp16.engine")
     vae_dec_engine = os.path.join(args.output_dir, "vae_decode_fp16.engine")
-    dec_engine = os.path.join(args.output_dir, "decoder_fp16.engine")
 
     # ================================================================
     # Step 1: Load model
@@ -124,22 +123,10 @@ def main():
             )
             logger.info("VAE decoder exported in %.1fs", time.time() - t0)
 
-        # DiT decoder
-        logger.info("Exporting DiT decoder...")
-        from acestep.engine.trt.export import export_decoder_onnx, OnnxExportConfig
-
-        with handler._load_model_context("model"):
-            t0 = time.time()
-            export_decoder_onnx(
-                handler.model, dec_onnx, device=args.device,
-                config=OnnxExportConfig(seq_len=750, enc_len=200),
-            )
-            logger.info("DiT decoder exported in %.1fs", time.time() - t0)
-
         logger.info("All ONNX exports complete.")
     else:
         logger.info("Skipping ONNX export (--skip-onnx)")
-        for f in [vae_enc_onnx, vae_dec_onnx, dec_onnx]:
+        for f in [vae_enc_onnx, vae_dec_onnx]:
             if not os.path.exists(f):
                 logger.error("Missing ONNX file: %s", f)
                 sys.exit(1)
@@ -180,18 +167,6 @@ def main():
     build_vae_encode_engine(vae_enc_onnx, vae_enc_engine, config=vae_config)
     logger.info("VAE encode engine built in %.0fs", time.time() - t0)
 
-    # DiT decoder
-    logger.info("Building DiT decoder engine...")
-    from acestep.engine.trt.export import build_trt_engine, TRTBuildConfig
-
-    dit_config = TRTBuildConfig(
-        workspace_gb=args.workspace_gb,
-        seq_max=max_latent_frames,
-    )
-    t0 = time.time()
-    build_trt_engine(dec_onnx, dec_engine, config=dit_config)
-    logger.info("DiT decoder engine built in %.0fs", time.time() - t0)
-
     # ================================================================
     # Step 4: Verify
     # ================================================================
@@ -205,7 +180,6 @@ def main():
     for name, path in [
         ("VAE encode", vae_enc_engine),
         ("VAE decode", vae_dec_engine),
-        ("DiT decoder", dec_engine),
     ]:
         with open(path, "rb") as f:
             engine = rt.deserialize_cuda_engine(f.read())

@@ -241,6 +241,7 @@ def export_decoder_onnx(
             dynamic_axes=dynamic_axes,
             opset_version=config.opset_version,
             do_constant_folding=config.do_constant_folding,
+            dynamo=False,
         )
 
     logger.info("ONNX saved to %s", onnx_path)

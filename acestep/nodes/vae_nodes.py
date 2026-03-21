@@ -120,11 +120,14 @@ def _find_trt_engine(name: str) -> Optional[str]:
     (symlinked or manually placed). Searches both CWD-relative and
     package-relative paths.
     """
+    pkg_root = os.path.join(os.path.dirname(__file__), "..", "..")
     candidates = [
+        os.path.join("trt_engines_fresh", name),
+        os.path.join(pkg_root, "trt_engines_fresh", name),
         os.path.join("trt_engines_local", name),
-        os.path.join(os.path.dirname(__file__), "..", "..", "trt_engines_local", name),
+        os.path.join(pkg_root, "trt_engines_local", name),
         os.path.join("trt_engines", name),
-        os.path.join(os.path.dirname(__file__), "..", "..", "trt_engines", name),
+        os.path.join(pkg_root, "trt_engines", name),
     ]
     for c in candidates:
         p = os.path.abspath(c)
