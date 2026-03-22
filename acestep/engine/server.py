@@ -234,8 +234,17 @@ class Handler(BaseHTTPRequestHandler):
         # Timbre strength
         timbre_strength = req.pop("timbre_strength", None)
         if timbre_strength is not None and timbre_strength < 1.0 and refer_latent is not None:
-            duration = req.get("duration", 60.0)
-            silence = self.state.session.empty_latent(duration=duration)
+            # Match silence to actual latent frame count to avoid shape mismatch
+            T_ref = refer_latent.tensor.shape[1]
+            duration_from_frames = T_ref / 25.0
+            silence = self.state.session.empty_latent(duration=duration_from_frames)
+            sil_t = silence.tensor
+            if sil_t.shape[1] != T_ref:
+                sil_t = sil_t[:, :T_ref, :] if sil_t.shape[1] > T_ref else torch.nn.functional.pad(
+                    sil_t, (0, 0, 0, T_ref - sil_t.shape[1])
+                )
+                from acestep.nodes.types import Latent
+                silence = Latent(tensor=sil_t)
             refer_latent = self.state.session.blend_latents(
                 silence, refer_latent, alpha=float(timbre_strength),
             )
@@ -302,8 +311,19 @@ class Handler(BaseHTTPRequestHandler):
         context_latent = source.context_latent
         hint_strength = req.get("hint_strength")
         if hint_strength is not None and hint_strength < 1.0:
-            duration = req.get("duration", 60.0)
-            silence = self.state.session.empty_latent(duration=duration)
+            # Match silence to actual source frame count (not duration) to
+            # avoid shape mismatch when audio was snapped to pool boundaries.
+            T_ctx = context_latent.tensor.shape[1]
+            duration_from_frames = T_ctx / 25.0
+            silence = self.state.session.empty_latent(duration=duration_from_frames)
+            # Trim or pad silence to exactly match context_latent frames
+            sil_t = silence.tensor
+            if sil_t.shape[1] != T_ctx:
+                sil_t = sil_t[:, :T_ctx, :] if sil_t.shape[1] > T_ctx else torch.nn.functional.pad(
+                    sil_t, (0, 0, 0, T_ctx - sil_t.shape[1])
+                )
+                from acestep.nodes.types import Latent
+                silence = Latent(tensor=sil_t)
             context_latent = self.state.session.blend_latents(
                 silence, context_latent, alpha=float(hint_strength),
             )
@@ -336,6 +356,7 @@ class Handler(BaseHTTPRequestHandler):
             denoise=req.get("denoise", 1.0),
             steps=req.get("steps", 8),
             shift=req.get("shift", 3.0),
+            method=req.get("method", "ode"),
             **gen_kwargs,
         )
         t_gen = time.perf_counter() - t0

@@ -82,6 +82,7 @@ class DiffusionEngine:
         self.decoder = model.decoder
         self.trt_decoder = trt_decoder
         self._compiled_loop: Optional[Callable] = None
+        self._compiled_loop_sde: Optional[Callable] = None
 
     # ------------------------------------------------------------------
     # CUDA graph fast path
@@ -99,12 +100,17 @@ class DiffusionEngine:
         negative_condition_set: Optional[ConditionSet] = None,
         ode_noise_curve: Optional[torch.Tensor] = None,
     ) -> bool:
-        """Check if the precomputed fast path is viable."""
-        if config.infer_method != "ode":
-            return False
+        """Check if a compiled fast path is viable.
+
+        Supports both ODE and SDE with all per-frame curves
+        (velocity_scale, ode_noise_curve, sde_denoise_curve,
+        initial_noise_curve). These are baked into the compiled loop as
+        always-present tensor args with no-op sentinel values when inactive.
+
+        Still excluded: inpainting masks, x0_target blending,
+        per-condition hooks, multi-condition, and CFG.
+        """
         if latent_mask is not None:
-            return False
-        if velocity_scale is not None or sde_denoise_curve is not None:
             return False
         if x0_target is not None:
             return False
@@ -113,8 +119,6 @@ class DiffusionEngine:
         if not condition_set.is_single_condition:
             return False
         if negative_condition_set is not None:
-            return False
-        if ode_noise_curve is not None:
             return False
         return True
 
@@ -126,51 +130,105 @@ class DiffusionEngine:
         t_schedule: torch.Tensor,
         source_latents: Optional[torch.Tensor],
         attention_mask: torch.Tensor,
+        velocity_scale: Optional[torch.Tensor] = None,
+        ode_noise_curve: Optional[torch.Tensor] = None,
+        sde_denoise_curve: Optional[torch.Tensor] = None,
+        initial_noise_curve: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Precomputed fast path: single condition, ODE, no modulation.
+        """Compiled fast path: single condition, ODE or SDE, with curves.
 
-        Delegates to a compiled inner loop that the torch compiler can
-        see as a single graph (no Python overhead between steps).
+        Handles initial_noise_curve before the loop, then delegates to
+        a compiled inner loop. ODE and SDE use separate compiled
+        functions (cached in _compiled_loop and _compiled_loop_sde) to
+        avoid branching inside the compiled graph.
         """
         device = noise.device
         dtype = noise.dtype
         bsz = noise.shape[0]
         infer_steps = len(t_schedule) - 1
         cond = condition_set.conditions[0]
+        is_sde = config.infer_method == "sde"
 
-        # Initial state
+        # Initial state (with optional per-frame noise/source mixing)
         t_start = t_schedule[0].item()
-        if config.denoise < 1.0 and source_latents is not None:
+        if initial_noise_curve is not None and source_latents is not None:
+            curve = self._normalize_curve(initial_noise_curve)
+            xt = curve * noise + (1.0 - curve) * source_latents
+        elif config.denoise < 1.0 and source_latents is not None:
             xt = t_start * noise + (1.0 - t_start) * source_latents
         else:
             xt = noise.clone()
 
-        # Precompute schedule as stacked tensors (no per-step Python)
+        # Precompute schedule tensors
         t_curr_vec = t_schedule[:-1].unsqueeze(-1).expand(infer_steps, bsz)  # [steps, B]
-        dt_vec = (t_schedule[:-1] - t_schedule[1:])  # [steps]
-        # Final step: dt = t_curr (returns x0)
-        dt_vec = dt_vec.clone()
-        dt_vec[-1] = t_schedule[-2]
-        # [steps] -> [steps, 1, 1] for broadcasting with [B, T, D]
-        dt_vec = dt_vec.reshape(infer_steps, 1, 1)  # [steps, 1, 1]
+        t_next_vec = t_schedule[1:].reshape(infer_steps, 1, 1)  # [steps, 1, 1]
 
-        # Run compiled inner loop
-        if self._compiled_loop is None:
-            self._compiled_loop = torch.compile(
-                self._fast_loop,
-                backend="inductor",
-                dynamic=True,
-                mode="max-autotune-no-cudagraphs",
+        # Prepare curve tensors (always-present; no-op sentinels when inactive).
+        if velocity_scale is not None:
+            vs = self._normalize_curve(velocity_scale).to(device=device, dtype=dtype)
+        else:
+            vs = torch.ones(1, 1, 1, device=device, dtype=dtype)
+
+        if is_sde:
+            # SDE path
+            # Source latents for sde_denoise_curve blending (zeros if absent)
+            if source_latents is not None:
+                src = source_latents.to(device=device, dtype=dtype)
+            else:
+                src = torch.zeros_like(xt)
+
+            if sde_denoise_curve is not None:
+                sdc = self._normalize_curve(sde_denoise_curve).to(device=device, dtype=dtype)
+            else:
+                # When no sde_denoise_curve: curve=1.0 means full x0_pred re-noise
+                # (standard SDE behavior, no source blending)
+                sdc = torch.ones(1, 1, 1, device=device, dtype=dtype)
+
+            if self._compiled_loop_sde is None:
+                self._compiled_loop_sde = torch.compile(
+                    self._fast_loop_sde,
+                    backend="inductor",
+                    dynamic=True,
+                    mode="max-autotune-no-cudagraphs",
+                )
+
+            return self._compiled_loop_sde(
+                self.decoder, xt, t_curr_vec, t_next_vec,
+                attention_mask,
+                cond.encoder_hidden_states,
+                cond.encoder_attention_mask,
+                cond.context_latents,
+                infer_steps,
+                vs, sdc, src,
             )
+        else:
+            # ODE path
+            dt_vec = (t_schedule[:-1] - t_schedule[1:]).clone()
+            dt_vec[-1] = t_schedule[-2]
+            dt_vec = dt_vec.reshape(infer_steps, 1, 1)
 
-        return self._compiled_loop(
-            self.decoder, xt, t_curr_vec, dt_vec,
-            attention_mask,
-            cond.encoder_hidden_states,
-            cond.encoder_attention_mask,
-            cond.context_latents,
-            infer_steps,
-        )
+            if ode_noise_curve is not None:
+                onc = self._normalize_curve(ode_noise_curve).to(device=device, dtype=dtype)
+            else:
+                onc = torch.zeros(1, 1, 1, device=device, dtype=dtype)
+
+            if self._compiled_loop is None:
+                self._compiled_loop = torch.compile(
+                    self._fast_loop,
+                    backend="inductor",
+                    dynamic=True,
+                    mode="max-autotune-no-cudagraphs",
+                )
+
+            return self._compiled_loop(
+                self.decoder, xt, t_curr_vec, dt_vec, t_next_vec,
+                attention_mask,
+                cond.encoder_hidden_states,
+                cond.encoder_attention_mask,
+                cond.context_latents,
+                infer_steps,
+                vs, onc,
+            )
 
     @staticmethod
     def _fast_loop(
@@ -178,16 +236,20 @@ class DiffusionEngine:
         xt: torch.Tensor,
         t_curr_vec: torch.Tensor,
         dt_vec: torch.Tensor,
+        t_next_vec: torch.Tensor,
         attention_mask: torch.Tensor,
         enc_hs: torch.Tensor,
         enc_mask: torch.Tensor,
         ctx_lat: torch.Tensor,
         infer_steps: int,
+        velocity_scale: torch.Tensor,
+        ode_noise_curve: torch.Tensor,
     ) -> torch.Tensor:
-        """Inner loop as a standalone function for torch.compile.
+        """ODE inner loop for torch.compile.
 
-        By compiling this separately, the compiler can see the full loop
-        and optimize across step boundaries.
+        velocity_scale and ode_noise_curve are always-present tensors.
+        When inactive, they are ones/zeros respectively, making the
+        operations mathematical no-ops that the compiler can optimize.
         """
         for i in range(infer_steps):
             vt = decoder(
@@ -201,7 +263,61 @@ class DiffusionEngine:
                 use_cache=False,
                 past_key_values=None,
             )[0]
+            vt = vt * velocity_scale
             xt = xt - vt * dt_vec[i]
+            # ODE noise injection (no-op when zeros; naturally zero on
+            # final step since t_next_vec[-1] = 0)
+            xt = xt + torch.randn_like(xt) * ode_noise_curve * t_next_vec[i]
+        return xt
+
+    @staticmethod
+    def _fast_loop_sde(
+        decoder,
+        xt: torch.Tensor,
+        t_curr_vec: torch.Tensor,
+        t_next_vec: torch.Tensor,
+        attention_mask: torch.Tensor,
+        enc_hs: torch.Tensor,
+        enc_mask: torch.Tensor,
+        ctx_lat: torch.Tensor,
+        infer_steps: int,
+        velocity_scale: torch.Tensor,
+        sde_denoise_curve: torch.Tensor,
+        source_latents: torch.Tensor,
+    ) -> torch.Tensor:
+        """SDE inner loop for torch.compile.
+
+        At each step: predict x0 from velocity, then re-noise with
+        per-frame sde_denoise_curve blending between full re-noise
+        (toward x0_pred) and source-converging re-noise (toward
+        source_latents).
+
+        sde_denoise_curve=1.0 is standard SDE (full re-noise from x0).
+        sde_denoise_curve=0.0 pulls toward source_latents (preserve).
+        """
+        for i in range(infer_steps):
+            vt = decoder(
+                hidden_states=xt,
+                timestep=t_curr_vec[i],
+                timestep_r=t_curr_vec[i],
+                attention_mask=attention_mask,
+                encoder_hidden_states=enc_hs,
+                encoder_attention_mask=enc_mask,
+                context_latents=ctx_lat,
+                use_cache=False,
+                past_key_values=None,
+            )[0]
+            vt = vt * velocity_scale
+            # x0 prediction: x0 = xt - vt * t_curr
+            t_curr_broad = t_curr_vec[i].unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1]
+            x0_pred = xt - vt * t_curr_broad
+            # Re-noise with sde_denoise_curve blending.
+            # t_next=0 on final step makes this return x0_pred directly.
+            t_next = t_next_vec[i]  # [1, 1]
+            sde_noise = torch.randn_like(xt)
+            xt_full = t_next * sde_noise + (1.0 - t_next) * x0_pred
+            xt_source = t_next * sde_noise + (1.0 - t_next) * source_latents
+            xt = sde_denoise_curve * xt_full + (1.0 - sde_denoise_curve) * xt_source
         return xt
 
     # ------------------------------------------------------------------
@@ -726,11 +842,15 @@ class DiffusionEngine:
             condition_set, config, latent_mask,
             velocity_scale, sde_denoise_curve, x0_target, apply_hooks_fn,
             negative_condition_set, ode_noise_curve,
-        ) and initial_noise_curve is None:
+        ):
             diffusion_start = time.time()
             xt = self._generate_fast(
                 condition_set, config, noise, t_schedule,
                 source_latents, attention_mask,
+                velocity_scale=velocity_scale,
+                ode_noise_curve=ode_noise_curve,
+                sde_denoise_curve=sde_denoise_curve,
+                initial_noise_curve=initial_noise_curve,
             )
             diffusion_end = time.time()
             time_costs["diffusion_time_cost"] = diffusion_end - diffusion_start

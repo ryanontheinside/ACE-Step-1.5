@@ -127,6 +127,7 @@ class Session:
         latent = self.encode_audio(audio)
         hints = self.extract_hints(latent)
         context_latent = self.hints_to_latent(hints)
+
         return PreparedSource(
             latent=latent, hints=hints, context_latent=context_latent,
         )
@@ -183,6 +184,7 @@ class Session:
         denoise: float = 1.0,
         steps: int = 8,
         shift: float = 3.0,
+        method: str = "ode",
         **kwargs: Any,
     ) -> Latent:
         """Run the diffusion loop. Always executes (never cached)."""
@@ -190,6 +192,7 @@ class Session:
 
         config = DiffusionConfigNode().execute(
             steps=steps, shift=shift, seed=seed, denoise=denoise,
+            method=method,
         )["config"]
 
         return Generate().execute(
