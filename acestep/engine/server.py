@@ -179,23 +179,16 @@ class Handler(BaseHTTPRequestHandler):
         audio_bytes = self._read_body_bytes()
         audio = _audio_from_bytes(audio_bytes)
 
-        # Snap to nearest multiple of 5 latent frames (9600 audio samples)
+        # Snap to pool boundary (always trim, never pad, to stay within
+        # TRT engine max T)
         samples_per_pool = 1920 * 5  # 9600
         n_samples = audio.waveform.shape[-1]
         remainder = n_samples % samples_per_pool
         if remainder != 0:
-            if remainder <= samples_per_pool // 2:
-                # Trim
-                audio = type(audio)(
-                    waveform=audio.waveform[:, :n_samples - remainder],
-                    sample_rate=audio.sample_rate,
-                )
-            else:
-                # Pad
-                audio = type(audio)(
-                    waveform=torch.nn.functional.pad(audio.waveform, (0, samples_per_pool - remainder)),
-                    sample_rate=audio.sample_rate,
-                )
+            audio = type(audio)(
+                waveform=audio.waveform[:, :n_samples - remainder],
+                sample_rate=audio.sample_rate,
+            )
 
         t0 = time.perf_counter()
         source = self.state.session.prepare_source(audio)
@@ -419,9 +412,20 @@ def main():
     parser.add_argument("--project-root", default=".")
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--no-flash-attn", action="store_true")
+    parser.add_argument("--trt-decoder", default=None, help="Path to TRT decoder engine")
+    parser.add_argument("--trt-vae-encode", default=None, help="Path to TRT VAE encode engine")
+    parser.add_argument("--trt-vae-decode", default=None, help="Path to TRT VAE decode engine")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
+
+    trt_engines = {}
+    if args.trt_decoder:
+        trt_engines["decoder"] = args.trt_decoder
+    if args.trt_vae_encode:
+        trt_engines["vae_encode"] = args.trt_vae_encode
+    if args.trt_vae_decode:
+        trt_engines["vae_decode"] = args.trt_vae_decode
 
     state = SessionState()
     logger.info("Initializing session...")
@@ -429,6 +433,7 @@ def main():
         project_root=args.project_root,
         compile_model=not args.no_compile,
         use_flash_attention=not args.no_flash_attn,
+        trt_engines=trt_engines or None,
     )
     logger.info("Session ready.")
 

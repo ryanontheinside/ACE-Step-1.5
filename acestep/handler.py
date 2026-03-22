@@ -330,6 +330,8 @@ class AceStepHandler:
         offload_dit_to_cpu: bool = False,
         quantization: Optional[str] = None,
         prefer_source: Optional[str] = None,
+        skip_decoder: bool = False,
+        skip_vae: bool = False,
     ) -> Tuple[str, bool]:
         """
         Initialize DiT model service
@@ -343,6 +345,10 @@ class AceStepHandler:
             offload_to_cpu: Whether to offload models to CPU when not in use
             offload_dit_to_cpu: Whether to offload DiT model to CPU when not in use (only effective if offload_to_cpu is True)
             prefer_source: Preferred download source ("huggingface", "modelscope", or None for auto-detect)
+            skip_decoder: If True, discard decoder weights after loading the
+                model config. Use when a TRT engine handles decoding.
+            skip_vae: If True, skip loading VAE weights entirely. Use when
+                TRT VAE engines handle encode/decode.
 
         Returns:
             (status_message, enable_generate_button)
@@ -432,6 +438,16 @@ class AceStepHandler:
 
                 self.model.config._attn_implementation = attn_implementation
                 self.config = self.model.config
+
+                if skip_decoder:
+                    # Discard decoder weights before moving anything to GPU.
+                    # The model object and its utility methods (prepare_noise,
+                    # get_x0_from_noise, renoise) survive; only the decoder
+                    # submodule is replaced with an empty stub.
+                    import torch.nn as nn
+                    self.model.decoder = nn.Module()
+                    logger.info("[initialize_service] Decoder weights discarded (TRT engine will be used)")
+
                 # Move model to device and set dtype
                 if not self.offload_to_cpu:
                     self.model = self.model.to(device).to(self.dtype)
@@ -444,7 +460,7 @@ class AceStepHandler:
                         self.model = self.model.to("cpu").to(self.dtype)
                 self.model.eval()
                 
-                if compile_model:
+                if compile_model and not skip_decoder:
                     # Compile the decoder directly (not the parent model).
                     # DiffusionEngine and other callers access model.decoder,
                     # which would bypass a parent-level compiled wrapper.
@@ -468,7 +484,7 @@ class AceStepHandler:
                         self.model.decoder, backend="inductor", dynamic=True,
                         mode=compile_mode,
                     )
-                    
+
                     if self.quantization is not None:
                         from torchao.quantization import quantize_
                         if self.quantization == "int8_weight_only":
@@ -485,11 +501,10 @@ class AceStepHandler:
                             quant_config = Int8DynamicActivationInt8WeightConfig(act_mapping_type=MappingType.ASYMMETRIC)
                         else:
                             raise ValueError(f"Unsupported quantization type: {self.quantization}")
-                        
+
                         quantize_(self.model, quant_config)
                         logger.info(f"[initialize_service] DiT quantized with: {self.quantization}")
-                    
-                    
+
                 silence_latent_path = os.path.join(acestep_v15_checkpoint_path, "silence_latent.pt")
                 if os.path.exists(silence_latent_path):
                     self.silence_latent = torch.load(silence_latent_path).transpose(1, 2)
@@ -502,28 +517,36 @@ class AceStepHandler:
                 raise FileNotFoundError(f"ACE-Step V1.5 checkpoint not found at {acestep_v15_checkpoint_path}")
             
             # 2. Load VAE
-            vae_checkpoint_path = os.path.join(checkpoint_dir, "vae")
-            if os.path.exists(vae_checkpoint_path):
-                self.vae = AutoencoderOobleck.from_pretrained(vae_checkpoint_path)
-                # Use bfloat16 for VAE on GPU, otherwise use self.dtype (float32 on CPU)
-                vae_dtype = self._get_vae_dtype(device)
-                if not self.offload_to_cpu:
-                    self.vae = self.vae.to(device).to(vae_dtype)
-                else:
-                    self.vae = self.vae.to("cpu").to(vae_dtype)
-                self.vae.eval()
+            if skip_vae:
+                self.vae = None
+                logger.info("[initialize_service] VAE weights skipped (TRT engines will be used)")
             else:
-                raise FileNotFoundError(f"VAE checkpoint not found at {vae_checkpoint_path}")
+                vae_checkpoint_path = os.path.join(checkpoint_dir, "vae")
+                if os.path.exists(vae_checkpoint_path):
+                    self.vae = AutoencoderOobleck.from_pretrained(vae_checkpoint_path)
+                    vae_dtype = self._get_vae_dtype(device)
+                    if not self.offload_to_cpu:
+                        self.vae = self.vae.to(device).to(vae_dtype)
+                    else:
+                        self.vae = self.vae.to("cpu").to(vae_dtype)
+                    self.vae.eval()
+                else:
+                    raise FileNotFoundError(f"VAE checkpoint not found at {vae_checkpoint_path}")
 
-            if compile_model:
+            if compile_model and not skip_vae:
                 self.vae = torch.compile(self.vae, dynamic=True)
-            
+
             # 3. Load text encoder and tokenizer
+            # When TRT handles the decoder, the text encoder must NOT
+            # persist on GPU: its memory allocation causes 7x TRT kernel
+            # slowdown on Blackwell. Keep it on CPU and use
+            # _load_model_context("text_encoder") for on-demand GPU exec.
+            self._offload_text_encoder = skip_decoder
             text_encoder_path = os.path.join(checkpoint_dir, "Qwen3-Embedding-0.6B")
             if os.path.exists(text_encoder_path):
                 self.text_tokenizer = AutoTokenizer.from_pretrained(text_encoder_path)
                 self.text_encoder = AutoModel.from_pretrained(text_encoder_path)
-                if not self.offload_to_cpu:
+                if not self.offload_to_cpu and not skip_decoder:
                     self.text_encoder = self.text_encoder.to(device).to(self.dtype)
                 else:
                     self.text_encoder = self.text_encoder.to("cpu").to(self.dtype)
@@ -534,15 +557,14 @@ class AceStepHandler:
             # Determine actual attention implementation used
             actual_attn = getattr(self.config, "_attn_implementation", "eager")
             
-            status_msg = f"✅ Model initialized successfully on {device}\n"
+            status_msg = f"Model initialized on {device}\n"
             status_msg += f"Main model: {acestep_v15_checkpoint_path}\n"
-            status_msg += f"VAE: {vae_checkpoint_path}\n"
+            status_msg += f"VAE: {'TRT' if skip_vae else vae_checkpoint_path}\n"
+            status_msg += f"Decoder: {'TRT' if skip_decoder else 'PyTorch'}\n"
             status_msg += f"Text encoder: {text_encoder_path}\n"
             status_msg += f"Dtype: {self.dtype}\n"
             status_msg += f"Attention: {actual_attn}\n"
-            status_msg += f"Compiled: {compile_model}\n"
-            status_msg += f"Offload to CPU: {self.offload_to_cpu}\n"
-            status_msg += f"Offload DiT to CPU: {self.offload_dit_to_cpu}"
+            status_msg += f"Compiled: {compile_model}"
             
             return status_msg, True
             
@@ -662,11 +684,17 @@ class AceStepHandler:
     def _load_model_context(self, model_name: str):
         """
         Context manager to load a model to GPU and offload it back to CPU after use.
-        
+
         Args:
             model_name: Name of the model to load ("text_encoder", "vae", "model")
         """
-        if not self.offload_to_cpu:
+        if (
+            model_name == "text_encoder"
+            and getattr(self, "_offload_text_encoder", False)
+        ):
+            # TRT mode: text encoder lives on CPU, move to GPU temporarily
+            pass  # fall through to the offload logic below
+        elif not self.offload_to_cpu:
             yield
             return
 

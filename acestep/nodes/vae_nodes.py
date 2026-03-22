@@ -21,6 +21,20 @@ logger = logging.getLogger(__name__)
 
 _trt_vae_cache: dict[str, Any] = {}
 
+# Shared polygraphy CUDA stream for all TRT engines in this process.
+# Using torch.cuda.Stream causes a 14x performance degradation on
+# Blackwell GPUs when multiple TRT engines coexist. Polygraphy's
+# cuda.Stream (a thin wrapper around cudaStreamCreate) avoids this.
+_trt_stream = None
+
+def _get_trt_stream():
+    """Get or create the shared polygraphy CUDA stream."""
+    global _trt_stream
+    if _trt_stream is None:
+        from polygraphy import cuda as pg_cuda
+        _trt_stream = pg_cuda.Stream()
+    return _trt_stream
+
 
 def _trt_available() -> bool:
     """Check if TensorRT is importable."""
@@ -33,6 +47,7 @@ def _trt_available() -> bool:
 
 def _get_trt_vae(engine_path: str, device: torch.device):
     """Load or return cached TRT VAE engine + context + stream."""
+    engine_path = os.path.abspath(engine_path)
     if engine_path in _trt_vae_cache:
         return _trt_vae_cache[engine_path]
 
@@ -41,10 +56,9 @@ def _get_trt_vae(engine_path: str, device: torch.device):
 
     engine = engine_from_bytes(bytes_from_path(engine_path))
     ctx = engine.create_execution_context()
-    stream = torch.cuda.Stream(device)
     logger.info("Loaded TRT VAE engine: %s", engine_path)
 
-    entry = {"engine": engine, "context": ctx, "stream": stream}
+    entry = {"engine": engine, "context": ctx}
     _trt_vae_cache[engine_path] = entry
     return entry
 
@@ -55,21 +69,16 @@ def _trt_vae_decode(
     """Decode latents [B, D, T] -> audio [B, 2, samples] via TRT."""
     entry = _get_trt_vae(engine_path, device)
     ctx = entry["context"]
-    stream = entry["stream"]
+    stream = _get_trt_stream()
 
     # Ensure input is on GPU, fp32, contiguous
     lat = latents_bdt.to(device=device, dtype=torch.float32).contiguous()
-
-    # Sync default stream so all prior PyTorch/inductor work is visible
-    torch.cuda.current_stream(device).synchronize()
 
     ctx.set_input_shape("latents", tuple(lat.shape))
     ctx.set_tensor_address("latents", lat.data_ptr())
 
     out_shape = tuple(ctx.get_tensor_shape("audio"))
 
-    # Reuse cached output buffer when shape matches to avoid allocator
-    # contention under VRAM pressure (22MB buffer for 60s audio).
     cached = entry.get("_decode_buf")
     if cached is not None and cached.shape == out_shape:
         audio_buf = cached
@@ -79,12 +88,10 @@ def _trt_vae_decode(
 
     ctx.set_tensor_address("audio", audio_buf.data_ptr())
 
-    if not ctx.execute_async_v3(stream.cuda_stream):
+    if not ctx.execute_async_v3(stream.ptr):
         raise RuntimeError("TRT VAE decode failed")
     stream.synchronize()
 
-    # Return a clone so the caller owns the data and the cached buffer
-    # stays pinned for next call.
     return audio_buf.clone()
 
 
@@ -99,18 +106,12 @@ def _trt_vae_encode(
     """
     entry = _get_trt_vae(engine_path, device)
     ctx = entry["context"]
-    stream = entry["stream"]
+    stream = _get_trt_stream()
 
     inp = audio_bct.float().contiguous().to(device)
 
     # Release PyTorch's unused reserved VRAM before TRT encode.
-    # Encode inputs are large (~22MB for 60s audio) and after
-    # torch.compile fills VRAM, there may not be enough contiguous
-    # memory without reclaiming from PyTorch's reserved pool.
-    # Only needed here (not decode) because encode inputs are much
-    # larger. This is called rarely (only on source change).
     torch.cuda.empty_cache()
-    torch.cuda.current_stream(device).synchronize()
 
     ctx.set_input_shape("audio", tuple(inp.shape))
     ctx.set_tensor_address("audio", inp.data_ptr())
@@ -119,7 +120,7 @@ def _trt_vae_encode(
     moments_buf = torch.empty(out_shape, dtype=torch.float32, device=device)
     ctx.set_tensor_address("moments", moments_buf.data_ptr())
 
-    if not ctx.execute_async_v3(stream.cuda_stream):
+    if not ctx.execute_async_v3(stream.ptr):
         raise RuntimeError("TRT VAE encode failed")
     stream.synchronize()
 

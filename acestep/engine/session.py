@@ -58,6 +58,23 @@ class Session:
 
     Intermediate results are returned to the caller; the caller controls
     what gets reused between generations by holding references.
+
+    When ``trt_engines`` is provided, decoder and/or VAE PyTorch weights
+    are never loaded to GPU (or at all, for the VAE). The TRT engines
+    are loaded via polygraphy and wired into the DiffusionEngine and
+    VAE node cache directly.
+
+    Example::
+
+        s = Session(
+            project_root=".",
+            compile_model=False,
+            trt_engines={
+                "decoder": "trt_engines/decoder_mixed_v5.engine",
+                "vae_encode": "trt_engines/vae_encode_fp16_max6000.engine",
+                "vae_decode": "trt_engines/vae_decode_fp16_max6000.engine",
+            },
+        )
     """
 
     def __init__(
@@ -70,8 +87,17 @@ class Session:
         use_flash_attention: bool = True,
         offload_to_cpu: bool = False,
         quantization: Optional[str] = None,
+        trt_engines: Optional[dict[str, str]] = None,
     ):
+        import torch
         from acestep.handler import AceStepHandler
+
+        skip_decoder = bool(trt_engines and "decoder" in trt_engines)
+        skip_vae = bool(
+            trt_engines
+            and "vae_encode" in trt_engines
+            and "vae_decode" in trt_engines
+        )
 
         handler = AceStepHandler()
         handler.initialize_service(
@@ -82,11 +108,30 @@ class Session:
             use_flash_attention=use_flash_attention,
             offload_to_cpu=offload_to_cpu,
             quantization=quantization,
+            skip_decoder=skip_decoder,
+            skip_vae=skip_vae,
         )
 
         self.model = ModelHandle(handler=handler)
         self.clip = CLIPHandle(handler=handler)
         self.vae = VAEHandle(handler=handler)
+
+        # Wire up TRT engines
+        if trt_engines:
+            if "decoder" in trt_engines:
+                from acestep.engine.diffusion import DiffusionEngine
+                handler._diffusion_engine = DiffusionEngine(
+                    handler.model,
+                    trt_engine_path=trt_engines["decoder"],
+                )
+
+            # Pre-load VAE TRT engines into the node cache
+            from acestep.nodes.vae_nodes import _get_trt_vae
+            dev = torch.device(device)
+            if "vae_encode" in trt_engines:
+                _get_trt_vae(trt_engines["vae_encode"], dev)
+            if "vae_decode" in trt_engines:
+                _get_trt_vae(trt_engines["vae_decode"], dev)
 
     @property
     def handler(self):

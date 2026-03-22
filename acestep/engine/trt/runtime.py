@@ -5,22 +5,22 @@ inference through a pre-built TensorRT engine.  Designed to slot directly
 into DiffusionEngine._decoder_call().
 
 Buffer management:
-  - Input tensors are passed by pointer (zero-copy from PyTorch CUDA tensors)
-  - Output tensor is pre-allocated at the max profile size and sliced per call
-  - All execution uses the current PyTorch CUDA stream to avoid sync overhead
+  - Pre-allocated fp32 buffers per shape (zero per-call allocations)
+  - Inputs copied via .copy_() into pinned buffers each step
+  - Output is a view of the internal buffer (no clone)
+  - Dedicated non-default CUDA stream with wait_stream sync
 """
 
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Optional, Union
 
 import torch
 
 logger = logging.getLogger(__name__)
 
-# TRT tensor dtype -> torch dtype mapping
 _TRT_TO_TORCH = None
 
 def _get_trt_to_torch_map():
@@ -40,7 +40,7 @@ def _get_trt_to_torch_map():
 
 
 class TRTDecoder:
-    """TensorRT decoder engine with the same call signature as the PyTorch decoder.
+    """TensorRT decoder with pre-allocated buffers.
 
     Usage::
 
@@ -77,35 +77,48 @@ class TRTDecoder:
 
         self.context = self.engine.create_execution_context()
 
-        # Dedicated non-default stream for TRT execution.
-        # TRT on the default stream triggers extra cudaStreamSynchronize
-        # calls internally and degrades performance.
-        self._stream = torch.cuda.Stream(device=self.device)
+        # Shared polygraphy stream for all TRT engines.
+        from acestep.nodes.vae_nodes import _get_trt_stream
+        self._stream = _get_trt_stream()
 
-        # Determine output dtype from engine
+        # Output dtype from engine
         dtype_map = _get_trt_to_torch_map()
         out_trt_dtype = self.engine.get_tensor_dtype(self.OUTPUT_NAME)
         self._output_dtype = dtype_map.get(out_trt_dtype, torch.float32)
 
-        # Cached output buffer (allocated on first call or shape change)
-        self._output_buffer: Optional[torch.Tensor] = None
+        # Per-shape buffer cache: shape_key -> {bufs, output}
+        self._buf_cache: dict[tuple, dict] = {}
 
         logger.info("TRT decoder ready (output_dtype=%s)", self._output_dtype)
 
-    def _ensure_contiguous(self, t: torch.Tensor, name: str) -> torch.Tensor:
-        """Ensure tensor is contiguous and on the right device.
+    def _get_bufs(self, hs_shape, ts_shape, enc_shape, cl_shape):
+        """Get or allocate pre-pinned fp32 buffers for these shapes."""
+        key = (hs_shape, ts_shape, enc_shape, cl_shape)
+        if key in self._buf_cache:
+            return self._buf_cache[key]
 
-        TRT needs contiguous memory; the dtype is left as-is because the
-        engine was built with fp32 inputs and TRT handles internal conversion.
-        """
-        if not t.is_contiguous():
-            t = t.contiguous()
-        if t.device != self.device:
-            t = t.to(self.device)
-        # Cast to fp32 for the TRT engine (exported in fp32)
-        if t.dtype != torch.float32:
-            t = t.float()
-        return t
+        ctx = self.context
+        dev = self.device
+
+        bufs = {
+            "hidden_states": torch.empty(hs_shape, dtype=torch.float32, device=dev),
+            "timestep": torch.empty(ts_shape, dtype=torch.float32, device=dev),
+            "encoder_hidden_states": torch.empty(enc_shape, dtype=torch.float32, device=dev),
+            "context_latents": torch.empty(cl_shape, dtype=torch.float32, device=dev),
+        }
+
+        for name, buf in bufs.items():
+            ctx.set_input_shape(name, tuple(buf.shape))
+            ctx.set_tensor_address(name, buf.data_ptr())
+
+        out_shape = tuple(ctx.get_tensor_shape(self.OUTPUT_NAME))
+        out_buf = torch.empty(out_shape, dtype=self._output_dtype, device=dev)
+        ctx.set_tensor_address(self.OUTPUT_NAME, out_buf.data_ptr())
+
+        entry = {"bufs": bufs, "output": out_buf}
+        self._buf_cache[key] = entry
+        logger.info("Allocated TRT buffers for shapes: hs=%s enc=%s", list(hs_shape), list(enc_shape))
+        return entry
 
     def __call__(
         self,
@@ -116,61 +129,47 @@ class TRTDecoder:
     ) -> torch.Tensor:
         """Run one decoder step through TensorRT.
 
-        All inputs should be CUDA tensors.  Any dtype is accepted; they are
-        cast to fp32 to match the ONNX export.  The output is returned in
-        the engine's native output dtype (typically fp16 when built with FP16).
-
-        Returns:
-            velocity: [B, T, 64] tensor.
+        Accepts any dtype; inputs are copied into pre-allocated fp32 buffers.
+        Returns a view of the internal output buffer (caller must not hold
+        references across calls with different shapes).
         """
-        trt = self._trt
+        orig_T = hidden_states.shape[1]
+        pad = orig_T % 2 == 1
+        eff_T = orig_T + 1 if pad else orig_T
+
+        entry = self._get_bufs(
+            (hidden_states.shape[0], eff_T, 64),
+            tuple(timestep.shape),
+            tuple(encoder_hidden_states.shape),
+            (context_latents.shape[0], eff_T, 128),
+        )
+        bufs = entry["bufs"]
+
+        # Copy into pre-allocated fp32 buffers (handles any dtype)
+        if pad:
+            bufs["hidden_states"][:, :orig_T, :].copy_(hidden_states)
+            bufs["hidden_states"][:, orig_T:, :].zero_()
+            bufs["context_latents"][:, :orig_T, :].copy_(context_latents)
+            bufs["context_latents"][:, orig_T:, :].zero_()
+        else:
+            bufs["hidden_states"].copy_(hidden_states)
+            bufs["context_latents"].copy_(context_latents)
+        bufs["timestep"].copy_(timestep)
+        bufs["encoder_hidden_states"].copy_(encoder_hidden_states)
+
+        # Bind addresses
         ctx = self.context
+        for name, buf in bufs.items():
+            ctx.set_tensor_address(name, buf.data_ptr())
+        ctx.set_tensor_address(self.OUTPUT_NAME, entry["output"].data_ptr())
 
-        # Prepare inputs
-        hs = self._ensure_contiguous(hidden_states, "hidden_states")
-        ts = self._ensure_contiguous(timestep, "timestep")
-        enc = self._ensure_contiguous(encoder_hidden_states, "encoder_hidden_states")
-        cl = self._ensure_contiguous(context_latents, "context_latents")
-
-        # The ONNX graph requires seq_len to be even (patch_size=2).
-        # Pad by one frame if odd; crop back after execution.
-        orig_T = hs.shape[1]
-        if orig_T % 2 == 1:
-            hs = torch.nn.functional.pad(hs, (0, 0, 0, 1))
-            cl = torch.nn.functional.pad(cl, (0, 0, 0, 1))
-
-        inputs = {
-            "hidden_states": hs,
-            "timestep": ts,
-            "encoder_hidden_states": enc,
-            "context_latents": cl,
-        }
-
-        # Set input shapes and addresses
-        for name, tensor in inputs.items():
-            ctx.set_input_shape(name, tuple(tensor.shape))
-            ctx.set_tensor_address(name, tensor.data_ptr())
-
-        # Allocate output based on inferred shape
-        out_shape = tuple(ctx.get_tensor_shape(self.OUTPUT_NAME))
-        if self._output_buffer is None or self._output_buffer.shape != out_shape:
-            self._output_buffer = torch.empty(
-                out_shape, dtype=self._output_dtype, device=self.device,
-            )
-        output = self._output_buffer
-        ctx.set_tensor_address(self.OUTPUT_NAME, output.data_ptr())
-
-        # Execute on dedicated stream, synced with PyTorch's current stream
+        # Execute on shared polygraphy stream.
         stream = self._stream
-        stream.wait_stream(torch.cuda.current_stream(self.device))
-        if not ctx.execute_async_v3(stream.cuda_stream):
-            raise RuntimeError("TRT execute_async_v3 failed")
-        torch.cuda.current_stream(self.device).wait_stream(stream)
+        ctx.execute_async_v3(stream.ptr)
+        stream.synchronize()
 
-        output = output.clone()
-        if orig_T % 2 == 1:
-            output = output[:, :orig_T, :]
-        return output
+        output = entry["output"]
+        return output[:, :orig_T, :] if pad else output
 
     def benchmark(
         self,
@@ -180,20 +179,13 @@ class TRTDecoder:
         warmup: int = 5,
         iterations: int = 20,
     ) -> dict:
-        """Benchmark TRT decoder throughput.
-
-        Returns dict with mean/min/max step time in ms and steps/sec.
-        """
         import time
-
         B, T, L = batch_size, seq_len, enc_len
-
         hs = torch.randn(B, T, 64, device=self.device, dtype=torch.float32)
         ts = torch.full((B,), 0.5, device=self.device, dtype=torch.float32)
         enc = torch.randn(B, L, 2048, device=self.device, dtype=torch.float32)
         ctx = torch.randn(B, T, 128, device=self.device, dtype=torch.float32)
 
-        # Warmup
         for _ in range(warmup):
             self(hs, ts, enc, ctx)
 
@@ -210,9 +202,7 @@ class TRTDecoder:
             "min_ms": min(times),
             "max_ms": max(times),
             "steps_per_sec": 1000.0 / (sum(times) / len(times)),
-            "seq_len": T,
-            "enc_len": L,
-            "batch_size": B,
+            "seq_len": T, "enc_len": L, "batch_size": B,
         }
         logger.info("TRT benchmark (T=%d, L=%d, B=%d):", T, L, B)
         logger.info(

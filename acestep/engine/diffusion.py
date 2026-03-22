@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from collections import OrderedDict
@@ -10,6 +11,8 @@ from transformers.cache_utils import DynamicCache, EncoderDecoderCache
 
 from .conditions import PreparedCondition, ConditionSet
 from .masking import LatentNoiseMask
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -67,22 +70,133 @@ class DiffusionEngine:
     and two-sided noise mask blending matching ComfyUI's KSamplerX0Inpaint.
     """
 
-    def __init__(self, model, trt_decoder=None):
+    def __init__(self, model, trt_engine_path=None):
         """
         Args:
             model: AceStepConditionGenerationModel instance.
-            trt_decoder: Optional TRTDecoder instance.  When provided, all
-                decoder calls are routed through TensorRT instead of the
-                PyTorch model.  All engine modulations (temporal blending,
-                velocity scaling, noise masks, etc.) continue to work
-                because they operate on the velocity output, not inside
-                the decoder.
+            trt_engine_path: Optional path to a TRT decoder engine file.
+                When provided, the engine is loaded via polygraphy and
+                all decoder calls are routed through TensorRT. All engine
+                modulations (temporal blending, velocity scaling, noise
+                masks, etc.) continue to work because they operate on the
+                velocity output, not inside the decoder.
         """
         self.model = model
         self.decoder = model.decoder
-        self.trt_decoder = trt_decoder
         self._compiled_loop: Optional[Callable] = None
         self._compiled_loop_sde: Optional[Callable] = None
+
+        # TRT state (owned directly, no wrapper class).
+        # Uses polygraphy engine loading and polygraphy CUDA stream to
+        # avoid Blackwell multi-engine kernel slowdown.
+        self._trt_engine = None
+        self._trt_ctx = None
+        self._trt_stream = None
+        self._trt_buf_cache: dict[tuple, dict] = {}
+
+        if trt_engine_path is not None:
+            self.load_trt_engine(trt_engine_path)
+
+    # ------------------------------------------------------------------
+    # TRT engine management
+    # ------------------------------------------------------------------
+
+    def load_trt_engine(self, engine_path):
+        """Load a TRT decoder engine via polygraphy.
+
+        Uses polygraphy.backend.trt.engine_from_bytes (not
+        trt.Runtime().deserialize_cuda_engine) to avoid process-global
+        TRT state corruption on Blackwell GPUs with multiple engines.
+        Shares the process-wide polygraphy CUDA stream with VAE engines.
+        """
+        from pathlib import Path
+        from polygraphy.backend.common import bytes_from_path
+        from polygraphy.backend.trt import engine_from_bytes
+        from acestep.nodes.vae_nodes import _get_trt_stream
+
+        engine_path = Path(engine_path)
+        if not engine_path.exists():
+            raise FileNotFoundError(f"TRT engine not found: {engine_path}")
+
+        logger.info("Loading TRT decoder engine from %s ...", engine_path)
+        self._trt_engine = engine_from_bytes(bytes_from_path(str(engine_path)))
+        self._trt_ctx = self._trt_engine.create_execution_context()
+        self._trt_stream = _get_trt_stream()
+        self._trt_buf_cache = {}
+        logger.info("TRT decoder engine ready")
+
+    def _trt_decoder_step(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        context_latents: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run one decoder step through TRT with pre-allocated buffers.
+
+        Handles odd-T padding. Caches buffers by shape for reuse across
+        steps. Calls execute_async_v3 on the shared polygraphy stream.
+        """
+        orig_T = hidden_states.shape[1]
+        pad = orig_T % 2 == 1
+        eff_T = orig_T + 1 if pad else orig_T
+
+        key = (
+            (hidden_states.shape[0], eff_T, 64),
+            tuple(timestep.shape),
+            tuple(encoder_hidden_states.shape),
+            (context_latents.shape[0], eff_T, 128),
+        )
+
+        if key not in self._trt_buf_cache:
+            ctx = self._trt_ctx
+            dev = hidden_states.device
+            hs_shape, ts_shape, enc_shape, cl_shape = key
+
+            bufs = {
+                "hidden_states": torch.empty(hs_shape, dtype=torch.float32, device=dev),
+                "timestep": torch.empty(ts_shape, dtype=torch.float32, device=dev),
+                "encoder_hidden_states": torch.empty(enc_shape, dtype=torch.float32, device=dev),
+                "context_latents": torch.empty(cl_shape, dtype=torch.float32, device=dev),
+            }
+            for name, buf in bufs.items():
+                ctx.set_input_shape(name, tuple(buf.shape))
+                ctx.set_tensor_address(name, buf.data_ptr())
+
+            out_shape = tuple(ctx.get_tensor_shape("velocity"))
+            out_buf = torch.empty(out_shape, dtype=torch.float32, device=dev)
+            ctx.set_tensor_address("velocity", out_buf.data_ptr())
+
+            self._trt_buf_cache[key] = {"bufs": bufs, "output": out_buf}
+            logger.info(
+                "Allocated TRT buffers for shapes: hs=%s enc=%s",
+                list(hs_shape), list(enc_shape),
+            )
+
+        entry = self._trt_buf_cache[key]
+        bufs = entry["bufs"]
+
+        if pad:
+            bufs["hidden_states"][:, :orig_T, :].copy_(hidden_states)
+            bufs["hidden_states"][:, orig_T:, :].zero_()
+            bufs["context_latents"][:, :orig_T, :].copy_(context_latents)
+            bufs["context_latents"][:, orig_T:, :].zero_()
+        else:
+            bufs["hidden_states"].copy_(hidden_states)
+            bufs["context_latents"].copy_(context_latents)
+        bufs["timestep"].copy_(timestep)
+        bufs["encoder_hidden_states"].copy_(encoder_hidden_states)
+
+        ctx = self._trt_ctx
+        for name, buf in bufs.items():
+            ctx.set_tensor_address(name, buf.data_ptr())
+        ctx.set_tensor_address("velocity", entry["output"].data_ptr())
+
+        ctx.execute_async_v3(self._trt_stream.ptr)
+        self._trt_stream.synchronize()
+
+        output = entry["output"]
+        return output[:, :orig_T, :] if pad else output
 
     # ------------------------------------------------------------------
     # CUDA graph fast path
@@ -112,7 +226,7 @@ class DiffusionEngine:
         inpainting masks, x0_target blending, per-condition hooks,
         multi-condition, and CFG.
         """
-        if self.trt_decoder is not None:
+        if self._trt_engine is not None:
             return False
         if latent_mask is not None:
             return False
@@ -454,12 +568,13 @@ class DiffusionEngine:
     ) -> Tuple[torch.Tensor, Optional[EncoderDecoderCache]]:
         """Single decoder forward pass.
 
-        When trt_decoder is set, routes through TensorRT (no KV cache).
+        When a TRT engine is loaded, routes through TensorRT via
+        execute_async_v3 on the shared polygraphy stream (no KV cache).
         All engine modulations continue to work unchanged because they
         operate on the velocity tensor returned here.
         """
-        if self.trt_decoder is not None:
-            vt = self.trt_decoder(
+        if self._trt_engine is not None:
+            vt = self._trt_decoder_step(
                 hidden_states=xt,
                 timestep=t_curr_tensor,
                 encoder_hidden_states=condition.encoder_hidden_states,
@@ -832,14 +947,152 @@ class DiffusionEngine:
         else:
             noise = self.model.prepare_noise(ref_cond.context_latents, config.seed)
 
-        # Timestep schedule (with denoise truncation)
-        t_schedule = self._build_timestep_schedule(config, device, dtype)
+        # Timestep schedule (with denoise truncation).
+        # Move to CPU so .item() in the loop doesn't trigger
+        # cudaStreamSynchronize on the default stream, which causes
+        # TRT performance degradation on Blackwell GPUs.
+        t_schedule = self._build_timestep_schedule(config, device, dtype).cpu()
         infer_steps = len(t_schedule) - 1
 
         if infer_steps <= 0 or config.denoise <= 0.0:
             # No denoising: return source latents directly
             out = source_latents if source_latents is not None else noise
             return {"target_latents": out, "time_costs": {}}
+
+        # ---- TRT fast path: tight loop, no torch stream interaction ----
+        if (
+            self._trt_engine is not None
+            and condition_set.is_single_condition
+            and latent_mask is None
+            and x0_target is None
+            and apply_hooks_fn is None
+            and negative_condition_set is None
+        ):
+            diffusion_start = time.time()
+            cond = condition_set.conditions[0]
+            t_start = t_schedule[0].item()
+
+            if initial_noise_curve is not None and source_latents is not None:
+                curve = self._normalize_curve(initial_noise_curve)
+                xt = curve * noise + (1.0 - curve) * source_latents
+            elif config.denoise < 1.0 and source_latents is not None:
+                xt = t_start * noise + (1.0 - t_start) * source_latents
+            else:
+                xt = noise.clone()
+
+            trt_ctx = self._trt_ctx
+            stream = self._trt_stream
+
+            # Pre-allocate fp32 buffers and bind once (like StreamDiffusion)
+            T = xt.shape[1]
+            eff_T = T + 1 if T % 2 == 1 else T
+            enc_hs = cond.encoder_hidden_states.float().contiguous()
+            ctx_lat = cond.context_latents.float().contiguous()
+            L = enc_hs.shape[1]
+
+            bufs = {
+                "hidden_states": torch.empty(bsz, eff_T, 64, dtype=torch.float32, device=device),
+                "timestep": torch.empty(bsz, dtype=torch.float32, device=device),
+                "encoder_hidden_states": torch.empty(bsz, L, 2048, dtype=torch.float32, device=device),
+                "context_latents": torch.empty(bsz, eff_T, 128, dtype=torch.float32, device=device),
+            }
+            for name, buf in bufs.items():
+                ok = trt_ctx.set_input_shape(name, tuple(buf.shape))
+                trt_ctx.set_tensor_address(name, buf.data_ptr())
+                if not ok:
+                    logger.error("set_input_shape(%s, %s) failed", name, tuple(buf.shape))
+            out_shape = tuple(trt_ctx.get_tensor_shape("velocity"))
+            if any(d < 0 for d in out_shape):
+                logger.error("TRT output shape unresolved: %s (T=%d, eff_T=%d, L=%d, bsz=%d)", out_shape, T, eff_T, L, bsz)
+                raise RuntimeError(f"TRT output shape unresolved: {out_shape}. Inputs: T={T}, eff_T={eff_T}, L={L}, bsz={bsz}")
+            out_buf = torch.empty(out_shape, dtype=torch.float32, device=device)
+            trt_ctx.set_tensor_address("velocity", out_buf.data_ptr())
+
+            # Pre-copy constant condition tensors
+            bufs["encoder_hidden_states"].copy_(enc_hs)
+            if T % 2 == 1:
+                bufs["context_latents"][:, :T, :].copy_(ctx_lat)
+                bufs["context_latents"][:, T:, :].zero_()
+            else:
+                bufs["context_latents"].copy_(ctx_lat)
+
+            if config.infer_method == "ode":
+                for i in range(infer_steps):
+                    t_curr = t_schedule[i].item()
+                    t_next = t_schedule[i + 1].item()
+                    dt = t_next - t_curr
+
+                    if T % 2 == 1:
+                        bufs["hidden_states"][:, :T, :].copy_(xt)
+                        bufs["hidden_states"][:, T:, :].zero_()
+                    else:
+                        bufs["hidden_states"].copy_(xt)
+                    bufs["timestep"].fill_(t_curr)
+
+                    for name, buf in bufs.items():
+                        trt_ctx.set_tensor_address(name, buf.data_ptr())
+                    trt_ctx.set_tensor_address("velocity", out_buf.data_ptr())
+
+                    trt_ctx.execute_async_v3(stream.ptr)
+                    stream.synchronize()
+
+                    vt = out_buf[:, :T, :].to(dtype)
+                    if velocity_scale is not None:
+                        vt = vt * self._normalize_curve(velocity_scale)
+                    xt = xt + dt * vt
+                    if (
+                        ode_noise_curve is not None
+                        and i < infer_steps - 1
+                        and t_next > 0
+                    ):
+                        xt = xt + torch.randn_like(xt) * self._normalize_curve(
+                            ode_noise_curve
+                        ) * t_next
+            else:
+                # SDE path
+                if sde_denoise_curve is not None:
+                    sdc = self._normalize_curve(sde_denoise_curve).to(
+                        device=device, dtype=dtype
+                    )
+                else:
+                    sdc = torch.ones(1, 1, 1, device=device, dtype=dtype)
+                src = source_latents if source_latents is not None else torch.zeros_like(xt)
+
+                for i in range(infer_steps):
+                    t_curr = t_schedule[i].item()
+                    t_next = t_schedule[i + 1].item()
+
+                    if T % 2 == 1:
+                        bufs["hidden_states"][:, :T, :].copy_(xt)
+                        bufs["hidden_states"][:, T:, :].zero_()
+                    else:
+                        bufs["hidden_states"].copy_(xt)
+                    bufs["timestep"].fill_(t_curr)
+
+                    for name, buf in bufs.items():
+                        trt_ctx.set_tensor_address(name, buf.data_ptr())
+                    trt_ctx.set_tensor_address("velocity", out_buf.data_ptr())
+
+                    trt_ctx.execute_async_v3(stream.ptr)
+                    stream.synchronize()
+
+                    vt = out_buf[:, :T, :].to(dtype)
+                    if velocity_scale is not None:
+                        vt = vt * self._normalize_curve(velocity_scale)
+                    x0_pred = xt - vt * t_curr
+                    sde_noise = torch.randn_like(xt)
+                    xt_full = t_next * sde_noise + (1.0 - t_next) * x0_pred
+                    xt_source = t_next * sde_noise + (1.0 - t_next) * src
+                    xt = sdc * xt_full + (1.0 - sdc) * xt_source
+
+            diffusion_end = time.time()
+            time_costs["diffusion_time_cost"] = diffusion_end - diffusion_start
+            time_costs["diffusion_per_step_time_cost"] = (
+                time_costs["diffusion_time_cost"] / max(infer_steps, 1)
+            )
+            time_costs["total_time_cost"] = diffusion_end - total_start_time
+            time_costs["trt_fast_path"] = True
+            return {"target_latents": xt, "time_costs": time_costs}
 
         # ---- Precomputed fast path ----
         if self._can_use_fast_path(
