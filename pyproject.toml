@@ -39,6 +39,8 @@ dependencies = [
     "xxhash",
     # TensorRT acceleration
     "tensorrt>=10.13,<10.14",
+    "polygraphy>=0.49",
+    "cuda-python>=13.0",
     # Local third-party packages
     "nano-vllm",
     "modelscope",

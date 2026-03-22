@@ -42,5 +42,10 @@ flash-attn @ https://github.com/kingbri1/flash-attention/releases/download/v2.8.
 flash-attn @ https://github.com/kingbri1/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu128torch2.9.0cxx11abiFALSE-cp311-cp311-linux_x86_64.whl ; sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'x86_64'
 xxhash
 
+# TensorRT acceleration
+tensorrt>=10.13,<10.14
+polygraphy>=0.49
+cuda-python>=13.0
+
 # Local package - install with: pip install -e acestep/third_parts/nano-vllm
 # nano-vllm
