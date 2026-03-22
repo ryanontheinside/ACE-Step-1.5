@@ -36,17 +36,11 @@ def _get_trt_vae(engine_path: str, device: torch.device):
     if engine_path in _trt_vae_cache:
         return _trt_vae_cache[engine_path]
 
-    import tensorrt as trt
+    from polygraphy.backend.common import bytes_from_path
+    from polygraphy.backend.trt import engine_from_bytes
 
-    rt = trt.Runtime(trt.Logger(trt.Logger.WARNING))
-    with open(engine_path, "rb") as f:
-        engine = rt.deserialize_cuda_engine(f.read())
-    if engine is None:
-        raise RuntimeError(f"Failed to load TRT engine: {engine_path}")
+    engine = engine_from_bytes(bytes_from_path(engine_path))
     ctx = engine.create_execution_context()
-    # Dedicated stream cached for the lifetime of the engine, avoids
-    # per-call stream creation overhead and isolates TRT work from
-    # PyTorch's default/inductor streams.
     stream = torch.cuda.Stream(device)
     logger.info("Loaded TRT VAE engine: %s", engine_path)
 

@@ -62,6 +62,8 @@ class TRTDecoder:
         device: Union[str, torch.device] = "cuda",
     ):
         import tensorrt as trt
+        from polygraphy.backend.common import bytes_from_path
+        from polygraphy.backend.trt import engine_from_bytes
 
         self._trt = trt
         engine_path = Path(engine_path)
@@ -69,16 +71,16 @@ class TRTDecoder:
             raise FileNotFoundError(f"TRT engine not found: {engine_path}")
 
         self.device = torch.device(device)
-        trt_logger = trt.Logger(trt.Logger.WARNING)
-        runtime = trt.Runtime(trt_logger)
 
         logger.info("Loading TRT engine from %s ...", engine_path)
-        with open(engine_path, "rb") as f:
-            self.engine = runtime.deserialize_cuda_engine(f.read())
-        if self.engine is None:
-            raise RuntimeError(f"Failed to deserialize engine: {engine_path}")
+        self.engine = engine_from_bytes(bytes_from_path(str(engine_path)))
 
         self.context = self.engine.create_execution_context()
+
+        # Dedicated non-default stream for TRT execution.
+        # TRT on the default stream triggers extra cudaStreamSynchronize
+        # calls internally and degrades performance.
+        self._stream = torch.cuda.Stream(device=self.device)
 
         # Determine output dtype from engine
         dtype_map = _get_trt_to_torch_map()
@@ -158,14 +160,12 @@ class TRTDecoder:
         output = self._output_buffer
         ctx.set_tensor_address(self.OUTPUT_NAME, output.data_ptr())
 
-        # Execute on PyTorch's current CUDA stream
-        stream = torch.cuda.current_stream(self.device)
+        # Execute on dedicated stream, synced with PyTorch's current stream
+        stream = self._stream
+        stream.wait_stream(torch.cuda.current_stream(self.device))
         if not ctx.execute_async_v3(stream.cuda_stream):
             raise RuntimeError("TRT execute_async_v3 failed")
-
-        # Sync not needed if staying on the same stream, but guard against
-        # edge cases where the caller reads immediately on a different stream
-        stream.synchronize()
+        torch.cuda.current_stream(self.device).wait_stream(stream)
 
         output = output.clone()
         if orig_T % 2 == 1:
