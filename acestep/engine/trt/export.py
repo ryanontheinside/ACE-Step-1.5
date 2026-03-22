@@ -70,6 +70,9 @@ class DecoderForExport(nn.Module):
         # Force SDPA so the graph contains only standard ops
         self.decoder.config._attn_implementation = "sdpa"
 
+        # Patch the decoder forward to be ONNX-trace-safe
+        self._patch_decoder_for_trace()
+
         if mixed_precision:
             self._setup_mixed_precision()
 
@@ -119,6 +122,125 @@ class DecoderForExport(nn.Module):
             layer.mlp_norm.float()
             if hasattr(layer, "cross_attn_norm"):
                 layer.cross_attn_norm.float()
+
+    def _patch_decoder_for_trace(self) -> None:
+        """Monkey-patch the decoder forward to be ONNX-trace-safe.
+
+        Fixes three trace-hostile patterns in the stock forward():
+
+          1. GQA in SDPA: transformers passes ``enable_gqa=True`` to
+             ``F.scaled_dot_product_attention`` when num_key_value_groups > 1
+             and attention_mask is None.  The ONNX exporter cannot convert
+             this.  We monkey-patch ``use_gqa_in_sdpa`` to return False so
+             the SDPA path falls back to ``repeat_kv`` (head expansion via
+             ``repeat_interleave``), which is fully traceable.
+
+          2. Shape-dependent Python branches: the original forward captures
+             ``original_seq_len = shape[1]`` as a Python int (baked constant
+             in ONNX) and uses ``if pad_length > 0`` (baked branch).  We
+             remove padding/cropping entirely; the caller must ensure
+             seq_len is a multiple of patch_size (=2, i.e. even).
+
+          3. ``create_4d_mask()`` builds shape-dependent masks that bake
+             traced dimensions.  Replaced with inline tensor ops for the
+             sliding window mask (bidirectional, ``|i-j| <= window``).
+             Full attention layers get ``None`` (is_causal=False on the
+             module means SDPA treats None as bidirectional).
+        """
+        import types
+
+        # --- Fix GQA: disable enable_gqa in SDPA for ONNX traceability ---
+        # When use_gqa_in_sdpa returns False, the transformers SDPA function
+        # manually expands K/V heads via repeat_kv (repeat_interleave) instead
+        # of passing enable_gqa=True.  repeat_interleave traces cleanly.
+        import transformers.integrations.sdpa_attention as _sdpa_mod
+        _sdpa_mod.use_gqa_in_sdpa = lambda *args, **kwargs: False
+
+        decoder = self.decoder
+        sliding_window = decoder.config.sliding_window  # 128
+        layer_types = decoder.config.layer_types  # list of "full_attention"/"sliding_attention"
+
+        def _export_forward(
+            self_dec,
+            hidden_states,
+            timestep,
+            timestep_r,
+            attention_mask,
+            encoder_hidden_states,
+            encoder_attention_mask,
+            context_latents,
+            use_cache=None,
+            past_key_values=None,
+            cache_position=None,
+            position_ids=None,
+            output_attentions=False,
+            return_hidden_states=None,
+            custom_layers_config=None,
+            enable_early_exit=False,
+            **flash_attn_kwargs,
+        ):
+            # Timestep embeddings
+            temb_t, timestep_proj_t = self_dec.time_embed(timestep)
+            temb_r, timestep_proj_r = self_dec.time_embed_r(timestep - timestep_r)
+            temb = temb_t + temb_r
+            timestep_proj = timestep_proj_t + timestep_proj_r
+
+            # Concatenate context
+            hidden_states = torch.cat([context_latents, hidden_states], dim=-1)
+
+            # No padding or cropping.  seq_len must be a multiple of
+            # patch_size (=2).  This avoids shape-dependent Python branches
+            # that bake constants into the ONNX graph.
+
+            # proj_in (patch embedding: Conv1d stride=2 halves seq_len)
+            hidden_states = self_dec.proj_in(hidden_states)
+            encoder_hidden_states = self_dec.condition_embedder(encoder_hidden_states)
+
+            # Position IDs / embeddings
+            seq_len_pat = hidden_states.shape[1]
+            cache_position = torch.arange(seq_len_pat, device=hidden_states.device)
+            position_ids = cache_position.unsqueeze(0)
+            position_embeddings = self_dec.rotary_emb(hidden_states, position_ids)
+
+            # Sliding window mask: bidirectional, |i-j| <= window.
+            # Uses tensor ops (arange, abs, where) so ONNX can trace them.
+            # Full attention layers get None (is_causal=False on the module
+            # means SDPA treats None as fully bidirectional).
+            indices = cache_position  # [seq_len_pat]
+            diff = indices.unsqueeze(0) - indices.unsqueeze(1)  # [S, S]
+            sw_mask = torch.where(
+                torch.abs(diff) <= sliding_window,
+                torch.zeros(1, device=hidden_states.device, dtype=hidden_states.dtype),
+                torch.full((1,), torch.finfo(hidden_states.dtype).min, device=hidden_states.device, dtype=hidden_states.dtype),
+            )
+            sw_mask = sw_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, S, S]
+
+            # Layer loop: static branching on layer_types (config, not runtime)
+            for i, layer_module in enumerate(self_dec.layers):
+                attn_mask = sw_mask if layer_types[i] == "sliding_attention" else None
+                layer_outputs = layer_module(
+                    hidden_states,
+                    position_embeddings,
+                    timestep_proj,
+                    attn_mask,
+                    position_ids,
+                    None,   # past_key_values
+                    False,  # output_attentions
+                    False,  # use_cache
+                    cache_position,
+                    encoder_hidden_states,
+                    None,   # encoder_attention_mask
+                )
+                hidden_states = layer_outputs[0]
+
+            # Output AdaLN + proj_out (ConvTranspose1d stride=2 doubles seq_len)
+            shift, scale = (self_dec.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
+            hidden_states = (self_dec.norm_out(hidden_states) * (1 + scale) + shift).type_as(hidden_states)
+            hidden_states = self_dec.proj_out(hidden_states)
+
+            return (hidden_states, None)
+
+        decoder.forward = types.MethodType(_export_forward, decoder)
 
     # ---- forward ----
 
@@ -244,7 +366,16 @@ def export_decoder_onnx(
             dynamo=False,
         )
 
-    logger.info("ONNX saved to %s", onnx_path)
+    # The ONNX file may exceed the 2GB protobuf limit since the decoder
+    # is ~6GB.  This is fine:
+    #   - OnnxRuntime uses its own parser (not protobuf) and handles it
+    #   - TRT's OnnxParser.parse_from_file also handles large inline ONNX
+    # The onnx Python library's load() cannot read >2GB files, which is
+    # why the previous external_data conversion produced 0-byte files.
+    # We skip it and rely on the native parsers.
+
+    size_mb = onnx_path.stat().st_size / (1 << 20)
+    logger.info("ONNX saved to %s (%.1f MB)", onnx_path, size_mb)
     return onnx_path
 
 

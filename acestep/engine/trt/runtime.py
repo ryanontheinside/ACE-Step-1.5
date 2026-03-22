@@ -130,6 +130,13 @@ class TRTDecoder:
         enc = self._ensure_contiguous(encoder_hidden_states, "encoder_hidden_states")
         cl = self._ensure_contiguous(context_latents, "context_latents")
 
+        # The ONNX graph requires seq_len to be even (patch_size=2).
+        # Pad by one frame if odd; crop back after execution.
+        orig_T = hs.shape[1]
+        if orig_T % 2 == 1:
+            hs = torch.nn.functional.pad(hs, (0, 0, 0, 1))
+            cl = torch.nn.functional.pad(cl, (0, 0, 0, 1))
+
         inputs = {
             "hidden_states": hs,
             "timestep": ts,
@@ -160,7 +167,10 @@ class TRTDecoder:
         # edge cases where the caller reads immediately on a different stream
         stream.synchronize()
 
-        return output.clone()
+        output = output.clone()
+        if orig_T % 2 == 1:
+            output = output[:, :orig_T, :]
+        return output
 
     def benchmark(
         self,

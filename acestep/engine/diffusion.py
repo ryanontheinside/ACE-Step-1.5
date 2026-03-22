@@ -107,9 +107,13 @@ class DiffusionEngine:
         initial_noise_curve). These are baked into the compiled loop as
         always-present tensor args with no-op sentinel values when inactive.
 
-        Still excluded: inpainting masks, x0_target blending,
-        per-condition hooks, multi-condition, and CFG.
+        Still excluded: TRT decoder (standard path routes through
+        _decoder_call which handles TRT; the compiled loop bypasses it),
+        inpainting masks, x0_target blending, per-condition hooks,
+        multi-condition, and CFG.
         """
+        if self.trt_decoder is not None:
+            return False
         if latent_mask is not None:
             return False
         if x0_target is not None:
