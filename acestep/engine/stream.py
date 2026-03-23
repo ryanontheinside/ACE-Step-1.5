@@ -75,17 +75,22 @@ class StreamPipeline:
         self,
         engine: DiffusionEngine,
         config: DiffusionConfig,
+        noise_sharing: float = 0.0,
     ):
         self.engine = engine
         self.decoder = engine.decoder
         self.model = engine.model
         self.config = config
+        self.noise_sharing = noise_sharing  # 0.0=off, 0.3-0.7 typical
 
         self._depth: int = config.infer_steps
 
         # Pipeline state
         self._slots: List[Optional[_Slot]] = [None] * self._depth
         self._queue: List[SlotRequest] = []
+
+        # Shared noise: last noise tensor used, for blending into next gen
+        self._last_noise: Optional[torch.Tensor] = None
 
         # Cached device/dtype (set on first submit)
         self._device: Optional[torch.device] = None
@@ -172,6 +177,14 @@ class StreamPipeline:
 
         t_schedule = self._get_schedule(request.denoise)
         noise = self._make_noise(request)
+
+        # Noise sharing: blend with previous generation's noise
+        alpha = self.noise_sharing
+        if alpha > 0.0 and self._last_noise is not None:
+            if self._last_noise.shape == noise.shape:
+                noise = alpha * self._last_noise + (1.0 - alpha**2) ** 0.5 * noise
+        self._last_noise = noise.clone()
+
         t_start = t_schedule[0].item()
 
         if request.source_latents is not None and request.denoise < 1.0:
