@@ -502,8 +502,10 @@ class DiffusionEngine:
         steps = config.infer_steps
         denoise = config.denoise
 
-        if denoise >= 1.0 or denoise <= 0.0:
-            # Full schedule or no-op
+        if denoise <= 0.0:
+            # No denoising: single-entry schedule (t=0 -> t=0)
+            return torch.zeros(2, device=device, dtype=dtype)
+        elif denoise >= 1.0:
             full_steps = steps
         else:
             # Compute extended schedule, then truncate

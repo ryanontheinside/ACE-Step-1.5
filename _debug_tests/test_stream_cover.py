@@ -187,7 +187,7 @@ output_chunks = []
 prev_dn = None
 last_latent = None
 last_wav = None
-skip_threshold = 1e-4
+skip_threshold = 1e-3
 num_skipped = 0
 mse_values = []
 

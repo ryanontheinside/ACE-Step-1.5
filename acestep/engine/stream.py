@@ -37,6 +37,7 @@ class SlotRequest:
     seed: Optional[int] = None
     source_latents: Optional[torch.Tensor] = None  # [1, T, D] for cover
     denoise: float = 1.0  # per-request denoise strength
+    sde_denoise_curve: Optional[torch.Tensor] = None  # [1, T, 1] per-frame denoise
 
 
 @dataclass
@@ -306,10 +307,10 @@ class StreamPipeline:
         """
         tick_start = time.time()
 
-        # Check for finished slot (slot at final step)
+        # Check for finished slot (slot at final step of its schedule)
         finished = None
         for i, slot in enumerate(self._slots):
-            if slot is not None and slot.step_idx >= self._depth:
+            if slot is not None and slot.step_idx >= len(slot.t_schedule) - 1:
                 finished = slot.xt
                 self._slots[i] = None
                 break
@@ -323,7 +324,7 @@ class StreamPipeline:
         # Collect active slots (exclude completed)
         active = [
             (i, s) for i, s in enumerate(self._slots)
-            if s is not None and s.step_idx < self._depth
+            if s is not None and s.step_idx < len(s.t_schedule) - 1
         ]
         if not active:
             self._last_tick_ms = (time.time() - tick_start) * 1000
@@ -380,14 +381,28 @@ class StreamPipeline:
             )
             vt_batch = decoder_out[0]
 
-        # ODE Euler step: each slot uses its own schedule
+        # Step: ODE (default) or SDE (when sde_denoise_curve is present)
         for batch_idx, (slot_idx, slot) in enumerate(zip(indices, slots)):
             t_curr = slot.t_schedule[slot.step_idx].item()
             t_next = slot.t_schedule[slot.step_idx + 1].item()
-            dt = t_next - t_curr
 
             vt = vt_batch[batch_idx:batch_idx+1]
-            slot.xt = slot.xt + dt * vt
+
+            if slot.request.sde_denoise_curve is not None and slot.request.source_latents is not None:
+                # SDE step: predict x0, re-noise, blend with source via curve
+                x0_pred = slot.xt - vt * t_curr
+                sde_noise = torch.randn_like(slot.xt)
+                xt_full = t_next * sde_noise + (1.0 - t_next) * x0_pred
+                xt_source = t_next * sde_noise + (1.0 - t_next) * slot.request.source_latents
+                sdc = slot.request.sde_denoise_curve.to(
+                    device=slot.xt.device, dtype=slot.xt.dtype
+                )
+                slot.xt = sdc * xt_full + (1.0 - sdc) * xt_source
+            else:
+                # ODE Euler step
+                dt = t_next - t_curr
+                slot.xt = slot.xt + dt * vt
+
             slot.step_idx += 1
 
         self._last_tick_ms = (time.time() - tick_start) * 1000
