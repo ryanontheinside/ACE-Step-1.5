@@ -415,6 +415,21 @@ class TRTBuildConfig:
     # attention/MLP run in fp16.
     strongly_typed: bool = False
 
+    def engine_filename(self) -> str:
+        """Generate a standardized engine filename from build config.
+
+        Format: decoder_{precision}_b{batch_max}_s{seq_max}.engine
+        """
+        if self.strongly_typed:
+            prec = "mixed"
+        elif self.bf16:
+            prec = "bf16"
+        elif self.fp16:
+            prec = "fp16"
+        else:
+            prec = "fp32"
+        return f"decoder_{prec}_b{self.batch_max}_s{self.seq_max}.engine"
+
 
 def build_trt_engine(
     onnx_path: Union[str, Path],

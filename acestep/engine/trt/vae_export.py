@@ -180,6 +180,20 @@ class VAETRTBuildConfig:
     encode_opt_samples: int = 2880000     # 60s
     encode_max_samples: int = 11520000    # 4min
 
+    def engine_filename(self, component: str) -> str:
+        """Generate a standardized engine filename.
+
+        Args:
+            component: "vae_encode" or "vae_decode"
+
+        Format: {component}_{precision}_s{max}.engine
+        """
+        prec = "fp16" if self.fp16 else "fp32"
+        if component == "vae_decode":
+            return f"vae_decode_{prec}_s{self.decode_max_frames}.engine"
+        else:
+            return f"vae_encode_{prec}_s{self.encode_max_samples}.engine"
+
 
 def build_vae_trt_engine(
     onnx_path: Union[str, Path],
