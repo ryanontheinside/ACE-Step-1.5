@@ -57,6 +57,18 @@ def _build_curve(spec: dict, length: int):
             offset=spec.get("offset", 0.0),
             length=length,
         )["curve"]
+    elif kind == "raw":
+        from acestep.nodes.types import Curve
+
+        values = spec.get("values", [])
+        t = torch.tensor(values, dtype=torch.float32)
+        if t.numel() == 0:
+            t = torch.ones(length)
+        elif t.numel() != length:
+            t = torch.nn.functional.interpolate(
+                t.view(1, 1, -1), size=length, mode="linear", align_corners=True,
+            ).view(length)
+        return Curve(tensor=t)
     else:
         raise ValueError(f"Unknown curve type: {kind}")
 

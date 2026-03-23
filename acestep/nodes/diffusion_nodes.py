@@ -57,6 +57,7 @@ class DiffusionConfigNode(BaseNode):
             use_cache=kwargs.get("use_cache", False),
             noise_on_cpu=kwargs.get("noise_on_cpu", True),
             denoise=kwargs.get("denoise", 1.0),
+            x0_target_gate=kwargs.get("x0_target_gate", 0.0),
         )
         return {"config": Config(config=config)}
 

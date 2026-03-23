@@ -49,6 +49,7 @@ class DiffusionConfig:
     noise_on_cpu: bool = True
     timesteps: Optional[List[float]] = None
     denoise: float = 1.0
+    x0_target_gate: float = 0.0
 
 
 class DiffusionEngine:
@@ -1232,7 +1233,8 @@ class DiffusionEngine:
             x0_target_curve_effective = None
             if x0_target is not None and x0_target_curve is not None:
                 step_progress = step_idx / max(infer_steps - 1, 1)
-                blend_gate = max(0.0, step_progress - 0.5) * 2.0
+                gate_start = config.x0_target_gate
+                blend_gate = max(0.0, step_progress - gate_start) / max(1.0 - gate_start, 1e-6)
                 if blend_gate > 0:
                     x0_target_effective = x0_target
                     x0_target_curve_effective = (
