@@ -124,7 +124,17 @@ class DiffusionEngine:
         self._trt_ctx = self._trt_engine.create_execution_context()
         self._trt_stream = _get_trt_stream()
         self._trt_buf_cache = {}
-        logger.info("TRT decoder engine ready")
+
+        # Detect I/O dtypes from engine (fp16 for mixed-precision, fp32 for legacy)
+        import tensorrt as trt
+        _trt_dtype_map = {
+            trt.float32: torch.float32,
+            trt.float16: torch.float16,
+            trt.bfloat16: torch.bfloat16,
+        }
+        hs_trt_dtype = self._trt_engine.get_tensor_dtype("hidden_states")
+        self._trt_io_dtype = _trt_dtype_map.get(hs_trt_dtype, torch.float32)
+        logger.info("TRT decoder engine ready (io_dtype=%s)", self._trt_io_dtype)
 
     def _trt_decoder_step(
         self,
@@ -153,19 +163,20 @@ class DiffusionEngine:
             ctx = self._trt_ctx
             dev = hidden_states.device
             hs_shape, ts_shape, enc_shape, cl_shape = key
+            io_dtype = self._trt_io_dtype
 
             bufs = {
-                "hidden_states": torch.empty(hs_shape, dtype=torch.float32, device=dev),
+                "hidden_states": torch.empty(hs_shape, dtype=io_dtype, device=dev),
                 "timestep": torch.empty(ts_shape, dtype=torch.float32, device=dev),
-                "encoder_hidden_states": torch.empty(enc_shape, dtype=torch.float32, device=dev),
-                "context_latents": torch.empty(cl_shape, dtype=torch.float32, device=dev),
+                "encoder_hidden_states": torch.empty(enc_shape, dtype=io_dtype, device=dev),
+                "context_latents": torch.empty(cl_shape, dtype=io_dtype, device=dev),
             }
             for name, buf in bufs.items():
                 ctx.set_input_shape(name, tuple(buf.shape))
                 ctx.set_tensor_address(name, buf.data_ptr())
 
             out_shape = tuple(ctx.get_tensor_shape("velocity"))
-            out_buf = torch.empty(out_shape, dtype=torch.float32, device=dev)
+            out_buf = torch.empty(out_shape, dtype=io_dtype, device=dev)
             ctx.set_tensor_address("velocity", out_buf.data_ptr())
 
             self._trt_buf_cache[key] = {"bufs": bufs, "output": out_buf}
@@ -984,18 +995,20 @@ class DiffusionEngine:
             trt_ctx = self._trt_ctx
             stream = self._trt_stream
 
-            # Pre-allocate fp32 buffers and bind once (like StreamDiffusion)
+            # Pre-allocate buffers and bind once (like StreamDiffusion).
+            # Uses engine's native I/O dtype (fp16 for mixed-precision, fp32 for legacy).
+            io_dtype = self._trt_io_dtype
             T = xt.shape[1]
             eff_T = T + 1 if T % 2 == 1 else T
-            enc_hs = cond.encoder_hidden_states.float().contiguous()
-            ctx_lat = cond.context_latents.float().contiguous()
+            enc_hs = cond.encoder_hidden_states.to(io_dtype).contiguous()
+            ctx_lat = cond.context_latents.to(io_dtype).contiguous()
             L = enc_hs.shape[1]
 
             bufs = {
-                "hidden_states": torch.empty(bsz, eff_T, 64, dtype=torch.float32, device=device),
+                "hidden_states": torch.empty(bsz, eff_T, 64, dtype=io_dtype, device=device),
                 "timestep": torch.empty(bsz, dtype=torch.float32, device=device),
-                "encoder_hidden_states": torch.empty(bsz, L, 2048, dtype=torch.float32, device=device),
-                "context_latents": torch.empty(bsz, eff_T, 128, dtype=torch.float32, device=device),
+                "encoder_hidden_states": torch.empty(bsz, L, 2048, dtype=io_dtype, device=device),
+                "context_latents": torch.empty(bsz, eff_T, 128, dtype=io_dtype, device=device),
             }
             for name, buf in bufs.items():
                 ok = trt_ctx.set_input_shape(name, tuple(buf.shape))
@@ -1006,7 +1019,7 @@ class DiffusionEngine:
             if any(d < 0 for d in out_shape):
                 logger.error("TRT output shape unresolved: %s (T=%d, eff_T=%d, L=%d, bsz=%d)", out_shape, T, eff_T, L, bsz)
                 raise RuntimeError(f"TRT output shape unresolved: {out_shape}. Inputs: T={T}, eff_T={eff_T}, L={L}, bsz={bsz}")
-            out_buf = torch.empty(out_shape, dtype=torch.float32, device=device)
+            out_buf = torch.empty(out_shape, dtype=io_dtype, device=device)
             trt_ctx.set_tensor_address("velocity", out_buf.data_ptr())
 
             # Pre-copy constant condition tensors
