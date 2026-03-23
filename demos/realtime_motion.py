@@ -41,6 +41,7 @@ DEFAULT_AUDIO = PROJECT_ROOT / "test_audio" / "new_order_confusion_60seconds.wav
 SAMPLE_RATE = 48000
 T = 1500  # 60s at 25fps
 CROSSFADE_SECONDS = 0.05
+LORA_PATH = str(PROJECT_ROOT.parent / "models" / "comfyui_models" / "loras" / "acestep1.5" / "daftpunkstyle1200.safetensors")
 
 
 # ---------------------------------------------------------------------------
@@ -203,9 +204,9 @@ class MidiKnobs:
                     break
             else:
                 raise
-        # K1=CC#70 (sde_curve/denoise), K2=CC#71 (seed)
-        self._values = {70: 0.0, 71: 0.0}
-        self._sensitivity = {70: 2.0, 71: 0.5}
+        # K1=CC#70 (denoise/sde_curve), K2=CC#71 (seed), K3=CC#72 (lora)
+        self._values = {70: 0.0, 71: 0.0, 72: 0.0}
+        self._sensitivity = {70: 2.0, 71: 0.5, 72: 2.0}
         self._lock = threading.Lock()
         self._running = True
         self._thread = threading.Thread(target=self._poll, daemon=True)
@@ -237,7 +238,7 @@ class MidiKnobs:
 # HUD drawing
 # ---------------------------------------------------------------------------
 
-def draw_hud(frame, audio_eng, motion, motion_history, num_gens, tick_ms, dec_ms, curve_val, denoise_val, seed):
+def draw_hud(frame, audio_eng, motion, motion_history, num_gens, tick_ms, dec_ms, curve_val, denoise_val, seed, lora_val):
     h, w = frame.shape[:2]
 
     # Playback position bar (bottom)
@@ -265,7 +266,7 @@ def draw_hud(frame, audio_eng, motion, motion_history, num_gens, tick_ms, dec_ms
     # Stats (top-left)
     cv2.putText(frame, f"gen #{num_gens}  tick={tick_ms:.0f}ms  dec={dec_ms:.0f}ms",
                 (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    cv2.putText(frame, f"denoise={denoise_val:.2f}  curve={curve_val:.2f}  seed={seed}",
+    cv2.putText(frame, f"denoise={denoise_val:.2f}  curve={curve_val:.2f}  seed={seed}  lora={lora_val:.2f}",
                 (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
     pass
@@ -355,6 +356,13 @@ def main():
 
     print(f"  Pipeline ready: {pipe.stats()['backend']}")
 
+    # Precompute LoRA deltas at unit strength for real-time scaling
+    from acestep.nodes.lora_nodes import _precompute_lora_deltas, _apply_lora_deltas
+    print(f"[Setup] Precomputing LoRA deltas...")
+    lora_deltas = _precompute_lora_deltas(LORA_PATH, strength=1.0, device=device, dtype=dtype)
+    lora_applied_scale = 0.0  # current scale baked into weights
+    print(f"  LoRA ready: {len(lora_deltas)} params")
+
     # ------------------------------------------------------------------
     # Start audio + input + display
     # ------------------------------------------------------------------
@@ -401,12 +409,14 @@ def main():
         "curve_val": 0.0,
         "denoise": 0.0,
         "seed": SEED,
+        "lora": 0.0,
     }
 
     # ------------------------------------------------------------------
     # Pipeline thread: submit, tick, decode, swap audio
     # ------------------------------------------------------------------
     def pipeline_loop():
+        nonlocal lora_applied_scale
         last_latent = None
         last_wav = None
 
@@ -418,9 +428,17 @@ def main():
             if use_midi:
                 k1_val = midi_knobs.get(70)  # K1: denoise or SDE curve
                 seed = int(midi_knobs.get(71) * 1000)  # K2: seed (0-1000)
+                lora_val = midi_knobs.get(72)  # K3: LoRA strength
             else:
                 k1_val = cur_motion
                 seed = SEED
+                lora_val = 0.0
+
+            # Adjust LoRA weight deltas to match target scale
+            if abs(lora_val - lora_applied_scale) > 1e-4:
+                diff = lora_val - lora_applied_scale
+                _apply_lora_deltas(engine.decoder, lora_deltas, sign=diff)
+                lora_applied_scale = lora_val
 
             sde_curve = None
             if use_sde:
@@ -472,6 +490,7 @@ def main():
                 stats["curve_val"] = k1_val
                 stats["denoise"] = denoise_val
                 stats["seed"] = seed
+                stats["lora"] = lora_val
 
     pipe_thread = threading.Thread(target=pipeline_loop, daemon=True)
     pipe_thread.start()
@@ -506,7 +525,8 @@ def main():
             draw_hud(frame, audio_eng, motion, motion_history,
                      stats["num_gens"], stats["tick_ms"],
                      stats["dec_ms"], stats["curve_val"],
-                     stats["denoise"], stats["seed"])
+                     stats["denoise"], stats["seed"],
+                     stats["lora"])
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             surf = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
