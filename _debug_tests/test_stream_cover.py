@@ -185,29 +185,40 @@ playback_start = 5.0  # seconds into the song
 playback_offset_samples = int(playback_start * SAMPLE_RATE)
 output_chunks = []
 prev_dn = None
+last_latent = None
+last_wav = None
+skip_threshold = 1e-4
+num_skipped = 0
+mse_values = []
 
-print(f"\n[Run] Starting pipeline (decode inline, {slice_duration}s slices)...")
+print(f"\n[Run] Starting pipeline (decode inline, {slice_duration}s slices, skip_threshold={skip_threshold})...")
 run_start = time.time()
 
 for tick_num in range(total_ticks):
-    # Submit next request with current denoise value
+    # Submit next request with current denoise value (no sync needed, pure CPU)
     if submit_idx < len(denoise_per_tick):
         dn = denoise_per_tick[submit_idx]
-        with timed("submit", quiet=True):
-            pipe.submit(SlotRequest(
-                encoder_hidden_states=entry.encoder_hidden_states,
-                encoder_attention_mask=entry.encoder_attention_mask,
-                context_latents=context_latents,
-                seed=SEED,
-                source_latents=source_latents,
-                denoise=dn,
-            ))
+        pipe.submit(SlotRequest(
+            encoder_hidden_states=entry.encoder_hidden_states,
+            encoder_attention_mask=entry.encoder_attention_mask,
+            context_latents=context_latents,
+            seed=SEED,
+            source_latents=source_latents,
+            denoise=dn,
+        ))
         submit_idx += 1
 
-    with timed("tick", quiet=True) as tick_t:
-        result = pipe.tick()
+    torch.cuda.synchronize()
+    iter_t0 = time.perf_counter()
+
+    result = pipe.tick()
 
     if result is not None:
+        # Sync once after tick to get accurate tick time
+        torch.cuda.synchronize()
+        tick_ms = (time.perf_counter() - iter_t0) * 1000
+        timings.setdefault("tick", []).append(tick_ms)
+
         # Figure out which denoise this result was submitted with
         submit_tick = tick_num - config.infer_steps
         if 0 <= submit_tick < len(denoise_per_tick):
@@ -215,10 +226,28 @@ for tick_num in range(total_ticks):
         else:
             dn_submitted = -1.0
 
-        # Decode immediately and extract slice
-        with timed("vae_decode", quiet=True) as dec_t:
+        # Similarity check: skip decode if latent barely changed
+        skipped = False
+        if last_latent is not None:
+            mse = (result - last_latent).pow(2).mean().item()
+            mse_values.append(mse)
+            if mse < skip_threshold and last_wav is not None:
+                wav = last_wav
+                skipped = True
+                num_skipped += 1
+
+        # Always update last_latent so comparisons are consecutive,
+        # not against a stale reference from many ticks ago
+        last_latent = result.clone()
+
+        if not skipped:
+            dec_t0 = time.perf_counter()
             audio_out = session.decode(Latent(tensor=result))
-        wav = audio_out.waveform.detach().cpu().float().squeeze(0)
+            torch.cuda.synchronize()
+            dec_ms = (time.perf_counter() - dec_t0) * 1000
+            timings.setdefault("vae_decode", []).append(dec_ms)
+            wav = audio_out.waveform.detach().cpu().float().squeeze(0)
+            last_wav = wav
 
         start = playback_offset_samples + num_completed * slice_samples
         end = start + slice_samples
@@ -234,18 +263,32 @@ for tick_num in range(total_ticks):
         output_chunks.append(chunk)
         num_completed += 1
 
+        dec_str = "SKIP" if skipped else f"{dec_ms:5.1f}ms"
+        mse_str = f"mse={mse:.2e}" if last_latent is not None and num_completed > 1 else ""
         if dn_submitted != prev_dn or num_completed % 20 == 0:
             print(f"  #{num_completed:3d} dn={dn_submitted:.2f}  "
-                  f"tick={tick_t.ms:5.1f}ms  decode={dec_t.ms:5.1f}ms  "
+                  f"tick={tick_ms:5.1f}ms  decode={dec_str:>7s}  {mse_str}  "
                   f"(playback {start/SAMPLE_RATE:.1f}s-{end/SAMPLE_RATE:.1f}s)")
             prev_dn = dn_submitted
+    else:
+        # No result (warmup/drain tick), still record tick time
+        torch.cuda.synchronize()
+        tick_ms = (time.perf_counter() - iter_t0) * 1000
+        timings.setdefault("tick", []).append(tick_ms)
 
     if pipe.active_slots == 0 and submit_idx >= len(denoise_per_tick):
         break
 
 run_ms = (time.time() - run_start) * 1000
+num_decoded = num_completed - num_skipped
 print(f"\n[Run] {num_completed} generations in {run_ms:.0f}ms "
       f"({run_ms/max(num_completed,1):.1f}ms avg incl. decode)")
+print(f"  Decoded: {num_decoded}, Skipped: {num_skipped} "
+      f"({100*num_skipped/max(num_completed,1):.0f}% skip rate)")
+if mse_values:
+    sorted_mse = sorted(mse_values)
+    print(f"  MSE: min={sorted_mse[0]:.2e}  median={sorted_mse[len(sorted_mse)//2]:.2e}  "
+          f"max={sorted_mse[-1]:.2e}")
 
 # Concatenate all chunks
 output_wav = torch.cat(output_chunks, dim=1)
@@ -271,7 +314,7 @@ print("TIMING SUMMARY")
 print(f"{'=' * 60}")
 for label in ["model_load", "load_audio", "vae_encode",
                "semantic_extract", "hints_to_latent", "text_encode",
-               "submit", "tick", "vae_decode"]:
+               "tick", "vae_decode"]:
     vals = timings.get(label, [])
     if not vals:
         continue
@@ -285,14 +328,18 @@ for label in ["model_load", "load_audio", "vae_encode",
               f"avg={avg:6.1f}ms  min={mn:6.1f}ms  max={mx:6.1f}ms  "
               f"({len(vals)} calls)")
 
-# Per-generation cost breakdown (tick + decode for ticks that produced output)
+# Per-generation cost breakdown (amortized over all generations)
 tick_vals = timings.get("tick", [])
 decode_vals = timings.get("vae_decode", [])
-if tick_vals and decode_vals:
-    avg_tick = sum(tick_vals) / len(tick_vals)
-    avg_decode = sum(decode_vals) / len(decode_vals)
-    print(f"\n  Per-generation avg:  tick={avg_tick:.1f}ms + decode={avg_decode:.1f}ms "
-          f"= {avg_tick + avg_decode:.1f}ms")
+if tick_vals:
+    tick_total = sum(tick_vals)
+    decode_total = sum(decode_vals) if decode_vals else 0
+    avg_tick = tick_total / num_completed
+    avg_decode_amortized = decode_total / num_completed
+    print(f"\n  Per-generation (amortized over {num_completed} gens):")
+    print(f"    tick={avg_tick:.1f}ms + decode={avg_decode_amortized:.1f}ms "
+          f"({num_decoded} decoded, {num_skipped} skipped) "
+          f"= {avg_tick + avg_decode_amortized:.1f}ms")
 
 print(f"\n[Summary]")
 print(f"  Listen to {OUTPUT_FILE.name} to hear the denoise knob sweep.")
