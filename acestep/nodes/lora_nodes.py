@@ -1,4 +1,11 @@
-"""LoRA loading and application nodes."""
+"""LoRA loading and application nodes.
+
+Supports two paths:
+  - PyTorch path: modifies decoder parameters directly (original behavior).
+  - TRT refit path: when a REFIT-enabled TRT engine is loaded, applies
+    LoRA via weight refitting without touching PyTorch parameters.
+    Detected automatically; no user configuration needed.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +19,14 @@ from .base import BaseNode, NodeDefinition, NodePort, NodeRegistry
 from .types import LoRA, ModelHandle
 
 logger = logging.getLogger(__name__)
+
+
+def _has_trt_lora(handler) -> bool:
+    """Check if handler has a TRT engine with LoRA refit support."""
+    engine = getattr(handler, "_diffusion_engine", None)
+    if engine is None:
+        return False
+    return getattr(engine, "trt_lora_available", False)
 
 
 @NodeRegistry.register
@@ -51,12 +66,9 @@ class LoadLoRA(BaseNode):
 class ApplyLoRA(BaseNode):
     """Apply a LoRA adapter to the model and return the modified handle.
 
-    Precomputes the full-rank deltas and stores them on the LoRA
-    object for efficient apply/remove during generation. The Generate
-    node uses the apply_hooks_fn mechanism to switch LoRA weights.
-
-    For simple single-LoRA generation, this node applies the LoRA
-    before generation and ensures it's removed after.
+    Automatically uses TRT weight refitting when a REFIT-enabled TRT
+    engine is loaded, otherwise falls back to direct PyTorch parameter
+    modification.
     """
 
     node_type_id: ClassVar[str] = "acestep.ApplyLoRA"
@@ -82,13 +94,23 @@ class ApplyLoRA(BaseNode):
         lora: LoRA = kwargs["lora"]
         handler = model_handle.handler
 
-        # Precompute deltas
+        # TRT refit path: apply LoRA to the TRT engine directly
+        if _has_trt_lora(handler):
+            lora_id = handler._diffusion_engine.apply_trt_lora(
+                lora.path, lora.scale,
+            )
+            # Store lora_id for RemoveLoRA
+            if not hasattr(handler, '_active_trt_lora_ids'):
+                handler._active_trt_lora_ids = []
+            handler._active_trt_lora_ids.append(lora_id)
+            return {"model": model_handle}
+
+        # PyTorch path: modify decoder parameters directly
         deltas = _precompute_lora_deltas(
             lora.path, lora.scale,
             handler.device, handler.dtype,
         )
 
-        # Apply to decoder
         with handler._load_model_context("model"):
             _apply_lora_deltas(handler.model.decoder, deltas, sign=1.0)
         logger.info(
@@ -96,7 +118,6 @@ class ApplyLoRA(BaseNode):
             lora.path, len(deltas), lora.scale,
         )
 
-        # Store deltas on handler for cleanup
         if not hasattr(handler, '_active_lora_deltas'):
             handler._active_lora_deltas = []
         handler._active_lora_deltas.append(deltas)
@@ -108,7 +129,7 @@ class ApplyLoRA(BaseNode):
 class RemoveLoRA(BaseNode):
     """Remove the most recently applied LoRA from the model.
 
-    Reverses the weight deltas applied by ApplyLoRA.
+    Handles both TRT refit and PyTorch parameter paths.
     """
 
     node_type_id: ClassVar[str] = "acestep.RemoveLoRA"
@@ -132,6 +153,15 @@ class RemoveLoRA(BaseNode):
         model_handle: ModelHandle = kwargs["model"]
         handler = model_handle.handler
 
+        # TRT refit path
+        if _has_trt_lora(handler):
+            ids = getattr(handler, '_active_trt_lora_ids', [])
+            if ids:
+                lora_id = ids.pop()
+                handler._diffusion_engine.remove_trt_lora(lora_id)
+            return {"model": model_handle}
+
+        # PyTorch path
         if hasattr(handler, '_active_lora_deltas') and handler._active_lora_deltas:
             deltas = handler._active_lora_deltas.pop()
             with handler._load_model_context("model"):
@@ -142,7 +172,7 @@ class RemoveLoRA(BaseNode):
 
 
 # -----------------------------------------------------------------------
-# Helpers
+# Helpers (PyTorch path)
 # -----------------------------------------------------------------------
 
 def _precompute_lora_deltas(

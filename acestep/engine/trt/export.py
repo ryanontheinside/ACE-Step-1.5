@@ -286,6 +286,13 @@ class OnnxExportConfig:
     # Use with TRTBuildConfig.strongly_typed=True for best FP16 accuracy.
     mixed_precision: bool = False
 
+    # When True, disables ONNX constant folding to preserve PyTorch
+    # parameter names as ONNX initializer names.  Required for TRT
+    # REFIT so the refitter can address weights by their original names.
+    # Without this, nn.Linear weights get auto-generated names like
+    # "onnx__MatMul_12882" that can't be mapped back to LoRA targets.
+    for_refit: bool = False
+
 
 def export_decoder_onnx(
     model,
@@ -351,6 +358,14 @@ def export_decoder_onnx(
         "velocity":               {0: "batch", 1: "seq_len"},
     }
 
+    # For refit-enabled builds, disable constant folding to preserve
+    # weight names as ONNX initializer names.  TRT does its own constant
+    # folding internally, so this has no effect on engine quality.
+    do_constant_folding = config.do_constant_folding
+    if config.for_refit:
+        do_constant_folding = False
+        logger.info("REFIT mode: constant folding disabled to preserve weight names")
+
     logger.info("Tracing decoder for ONNX export (T=%d, L=%d) ...", T, L)
 
     with torch.no_grad():
@@ -362,7 +377,7 @@ def export_decoder_onnx(
             output_names=output_names,
             dynamic_axes=dynamic_axes,
             opset_version=config.opset_version,
-            do_constant_folding=config.do_constant_folding,
+            do_constant_folding=do_constant_folding,
             dynamo=False,
         )
 
@@ -415,6 +430,11 @@ class TRTBuildConfig:
     # attention/MLP run in fp16.
     strongly_typed: bool = False
 
+    # Enable weight refitting.  Allows updating engine weights at runtime
+    # via trt.Refitter without rebuilding.  Required for dynamic LoRA.
+    # Slight engine size increase; negligible performance impact.
+    refit: bool = False
+
     def engine_filename(self) -> str:
         """Generate a standardized engine filename from build config.
 
@@ -428,7 +448,8 @@ class TRTBuildConfig:
             prec = "fp16"
         else:
             prec = "fp32"
-        return f"decoder_{prec}_b{self.batch_max}_s{self.seq_max}.engine"
+        refit_tag = "_refit" if self.refit else ""
+        return f"decoder_{prec}{refit_tag}_b{self.batch_max}_s{self.seq_max}.engine"
 
 
 def build_trt_engine(
@@ -493,6 +514,10 @@ def build_trt_engine(
             build_config.set_flag(trt.BuilderFlag.FP16)
     # STRONGLY_TYPED mode: precision is baked into the ONNX graph types,
     # so we don't set FP16 flag (TRT would ignore it anyway)
+
+    if config.refit:
+        build_config.set_flag(trt.BuilderFlag.REFIT)
+        logger.info("REFIT enabled: engine weights can be updated at runtime")
 
     if config.bf16 and hasattr(trt.BuilderFlag, "BF16"):
         build_config.set_flag(trt.BuilderFlag.BF16)

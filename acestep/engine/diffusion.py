@@ -95,6 +95,10 @@ class DiffusionEngine:
         self._trt_stream = None
         self._trt_buf_cache: dict[tuple, dict] = {}
 
+        # Dynamic LoRA via TRT weight refitting (initialized in load_trt_engine
+        # when the engine supports REFIT).
+        self._lora_manager = None
+
         if trt_engine_path is not None:
             self.load_trt_engine(trt_engine_path)
 
@@ -135,6 +139,83 @@ class DiffusionEngine:
         hs_trt_dtype = self._trt_engine.get_tensor_dtype("hidden_states")
         self._trt_io_dtype = _trt_dtype_map.get(hs_trt_dtype, torch.float32)
         logger.info("TRT decoder engine ready (io_dtype=%s)", self._trt_io_dtype)
+
+        # Try to initialize LoRA refit manager (requires REFIT-enabled engine)
+        self._lora_manager = None
+        try:
+            from acestep.engine.trt.lora_refit import TRTLoRAManager
+
+            # Find checkpoint for base weights (needed when decoder is
+            # discarded in TRT mode)
+            ckpt_path = None
+            cfg = getattr(self.model, "config", None)
+            if cfg is not None:
+                import os
+                candidate = os.path.join(
+                    getattr(cfg, "_name_or_path", ""), "model.safetensors"
+                )
+                if os.path.exists(candidate):
+                    ckpt_path = candidate
+
+            self._lora_manager = TRTLoRAManager(
+                engine=self._trt_engine,
+                decoder=self.decoder,
+                device=torch.device("cuda"),
+                trt_weight_prefix="decoder.",
+                checkpoint_path=ckpt_path,
+            )
+        except RuntimeError as e:
+            # Engine not built with REFIT, or TRT version too old
+            logger.info("TRT LoRA refit not available: %s", e)
+        except Exception as e:
+            logger.warning("Failed to init TRT LoRA manager: %s", e)
+
+    # ------------------------------------------------------------------
+    # TRT LoRA management (delegates to TRTLoRAManager)
+    # ------------------------------------------------------------------
+
+    def apply_trt_lora(self, lora_path: str, strength: float = 1.0) -> int:
+        """Apply a LoRA to the TRT engine via weight refitting.
+
+        Args:
+            lora_path: Path to .safetensors LoRA file.
+            strength: LoRA strength (0.0 = no effect, 1.0 = full).
+
+        Returns:
+            LoRA ID for later removal or strength adjustment.
+
+        Raises:
+            RuntimeError: If TRT engine doesn't support refit.
+        """
+        if self._lora_manager is None:
+            raise RuntimeError(
+                "TRT LoRA refit not available. Rebuild the decoder engine "
+                "with refit=True (OnnxExportConfig.for_refit=True + "
+                "TRTBuildConfig.refit=True)."
+            )
+        return self._lora_manager.apply_lora(lora_path, strength)
+
+    def remove_trt_lora(self, lora_id: int = -1) -> bool:
+        """Remove a LoRA from the TRT engine. Default: most recent."""
+        if self._lora_manager is None:
+            return False
+        return self._lora_manager.remove_lora(lora_id)
+
+    def set_trt_lora_strength(self, lora_id: int, strength: float) -> None:
+        """Adjust strength of an active TRT LoRA."""
+        if self._lora_manager is None:
+            raise RuntimeError("TRT LoRA refit not available")
+        self._lora_manager.set_lora_strength(lora_id, strength)
+
+    def remove_all_trt_loras(self) -> None:
+        """Remove all LoRAs and restore the TRT engine to base weights."""
+        if self._lora_manager is not None:
+            self._lora_manager.remove_all()
+
+    @property
+    def trt_lora_available(self) -> bool:
+        """True if the TRT engine supports dynamic LoRA via refit."""
+        return self._lora_manager is not None
 
     def _trt_decoder_step(
         self,

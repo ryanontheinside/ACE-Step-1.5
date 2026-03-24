@@ -56,7 +56,7 @@ def _find_project_root() -> str:
 def main():
     project_root = _find_project_root()
 
-    parser = argparse.ArgumentParser(description="Build ACE-Step VAE TRT engines")
+    parser = argparse.ArgumentParser(description="Build ACE-Step TRT engines")
     parser.add_argument("--output-dir", default=os.path.join(project_root, "trt_engines"),
                         help="Directory for ONNX and engine files")
     parser.add_argument("--checkpoint", default="acestep-v15-turbo",
@@ -68,6 +68,14 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--workspace-gb", type=float, default=8.0,
                         help="TRT builder workspace in GB")
+    parser.add_argument("--decoder", action="store_true",
+                        help="Build REFIT-enabled decoder engine (for dynamic LoRA)")
+    parser.add_argument("--decoder-mixed", action="store_true",
+                        help="Use mixed precision (fp16 bulk + fp32 critical ops) for decoder")
+    parser.add_argument("--batch-max", type=int, default=4,
+                        help="Max batch size for decoder engine (default: 4)")
+    parser.add_argument("--skip-vae", action="store_true",
+                        help="Skip VAE engine build (use with --decoder to build only decoder)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -98,80 +106,141 @@ def main():
         device=args.device,
         use_flash_attention=False,  # SDPA for export
         compile_model=False,
+        skip_vae=args.skip_vae,
     )
     logger.info("Model loaded.")
 
     # ================================================================
-    # Step 2: Export ONNX
+    # Step 2: Export VAE ONNX
     # ================================================================
-    if not args.skip_onnx:
-        logger.info("=" * 60)
-        logger.info("ONNX EXPORT")
-        logger.info("=" * 60)
+    if not args.skip_vae:
+        if not args.skip_onnx:
+            logger.info("=" * 60)
+            logger.info("VAE ONNX EXPORT")
+            logger.info("=" * 60)
 
-        from .vae_export import (
-            export_vae_encoder_onnx,
-            export_vae_decoder_onnx,
-            VAEExportConfig,
-        )
-
-        with handler._load_model_context("vae"):
-            t0 = time.time()
-            export_vae_encoder_onnx(
-                handler.vae, vae_enc_onnx, device=args.device,
-                config=VAEExportConfig(trace_audio_samples=48000 * 30),
+            from .vae_export import (
+                export_vae_encoder_onnx,
+                export_vae_decoder_onnx,
+                VAEExportConfig,
             )
-            logger.info("VAE encoder exported in %.1fs", time.time() - t0)
 
-            logger.info("Exporting VAE decoder...")
-            t0 = time.time()
-            export_vae_decoder_onnx(
-                handler.vae, vae_dec_onnx, device=args.device,
-                config=VAEExportConfig(trace_latent_frames=750),
-            )
-            logger.info("VAE decoder exported in %.1fs", time.time() - t0)
+            with handler._load_model_context("vae"):
+                t0 = time.time()
+                export_vae_encoder_onnx(
+                    handler.vae, vae_enc_onnx, device=args.device,
+                    config=VAEExportConfig(trace_audio_samples=48000 * 30),
+                )
+                logger.info("VAE encoder exported in %.1fs", time.time() - t0)
 
-        logger.info("All ONNX exports complete.")
+                logger.info("Exporting VAE decoder...")
+                t0 = time.time()
+                export_vae_decoder_onnx(
+                    handler.vae, vae_dec_onnx, device=args.device,
+                    config=VAEExportConfig(trace_latent_frames=750),
+                )
+                logger.info("VAE decoder exported in %.1fs", time.time() - t0)
+
+            logger.info("VAE ONNX exports complete.")
+        else:
+            logger.info("Skipping ONNX export (--skip-onnx)")
+            for f in [vae_enc_onnx, vae_dec_onnx]:
+                if not os.path.exists(f):
+                    logger.error("Missing ONNX file: %s", f)
+                    sys.exit(1)
     else:
-        logger.info("Skipping ONNX export (--skip-onnx)")
-        for f in [vae_enc_onnx, vae_dec_onnx]:
-            if not os.path.exists(f):
-                logger.error("Missing ONNX file: %s", f)
+        logger.info("Skipping VAE (--skip-vae)")
+
+    # ================================================================
+    # Step 2b: Decoder ONNX export (with REFIT naming)
+    # ================================================================
+    decoder_onnx = None
+    decoder_engine = None
+    if args.decoder:
+        from .export import OnnxExportConfig, export_decoder_onnx
+
+        decoder_onnx = os.path.join(args.output_dir, "decoder_refit.onnx")
+
+        if not args.skip_onnx:
+            logger.info("=" * 60)
+            logger.info("DECODER ONNX EXPORT (refit-enabled)")
+            logger.info("=" * 60)
+
+            onnx_cfg = OnnxExportConfig(
+                mixed_precision=args.decoder_mixed,
+                for_refit=True,
+            )
+            with handler._load_model_context("model"):
+                t0 = time.time()
+                export_decoder_onnx(
+                    handler.model, decoder_onnx,
+                    device=args.device, config=onnx_cfg,
+                )
+                logger.info("Decoder ONNX exported in %.1fs", time.time() - t0)
+        else:
+            if not os.path.exists(decoder_onnx):
+                logger.error("Missing decoder ONNX: %s", decoder_onnx)
                 sys.exit(1)
 
-    # Free model memory before TRT build
+    # Free model memory before TRT builds
     del handler
     torch.cuda.empty_cache()
 
     # ================================================================
-    # Step 3: Build TRT engines
+    # Step 3: Build VAE TRT engines
     # ================================================================
-    logger.info("=" * 60)
-    logger.info("TRT ENGINE BUILD (max_duration=%ds, max_frames=%d)",
-                args.max_duration, max_latent_frames)
-    logger.info("=" * 60)
+    if not args.skip_vae:
+        logger.info("=" * 60)
+        logger.info("VAE TRT BUILD (max_duration=%ds, max_frames=%d)",
+                    args.max_duration, max_latent_frames)
+        logger.info("=" * 60)
 
-    from .vae_export import (
-        build_vae_decode_engine,
-        build_vae_encode_engine,
-        VAETRTBuildConfig,
-    )
+        from .vae_export import (
+            build_vae_decode_engine,
+            build_vae_encode_engine,
+            VAETRTBuildConfig,
+        )
 
-    vae_config = VAETRTBuildConfig(
-        workspace_gb=args.workspace_gb,
-        decode_max_frames=max_latent_frames,
-        encode_max_samples=max_audio_samples,
-    )
+        vae_config = VAETRTBuildConfig(
+            workspace_gb=args.workspace_gb,
+            decode_max_frames=max_latent_frames,
+            encode_max_samples=max_audio_samples,
+        )
 
-    logger.info("Building VAE decode engine...")
-    t0 = time.time()
-    build_vae_decode_engine(vae_dec_onnx, vae_dec_engine, config=vae_config)
-    logger.info("VAE decode engine built in %.0fs", time.time() - t0)
+        logger.info("Building VAE decode engine...")
+        t0 = time.time()
+        build_vae_decode_engine(vae_dec_onnx, vae_dec_engine, config=vae_config)
+        logger.info("VAE decode engine built in %.0fs", time.time() - t0)
 
-    logger.info("Building VAE encode engine...")
-    t0 = time.time()
-    build_vae_encode_engine(vae_enc_onnx, vae_enc_engine, config=vae_config)
-    logger.info("VAE encode engine built in %.0fs", time.time() - t0)
+        logger.info("Building VAE encode engine...")
+        t0 = time.time()
+        build_vae_encode_engine(vae_enc_onnx, vae_enc_engine, config=vae_config)
+        logger.info("VAE encode engine built in %.0fs", time.time() - t0)
+
+    # ================================================================
+    # Step 3b: Build decoder TRT engine (with REFIT for LoRA)
+    # ================================================================
+    if args.decoder and decoder_onnx is not None:
+        from .export import build_trt_engine, TRTBuildConfig
+
+        trt_cfg = TRTBuildConfig(
+            fp16=True,
+            strongly_typed=args.decoder_mixed,
+            refit=True,
+            workspace_gb=args.workspace_gb,
+            batch_max=args.batch_max,
+            seq_max=max_latent_frames,
+        )
+        decoder_engine = os.path.join(args.output_dir, trt_cfg.engine_filename())
+
+        logger.info("=" * 60)
+        logger.info("DECODER TRT BUILD (refit=%s, mixed=%s)",
+                    trt_cfg.refit, args.decoder_mixed)
+        logger.info("=" * 60)
+        t0 = time.time()
+        build_trt_engine(decoder_onnx, decoder_engine, config=trt_cfg)
+        logger.info("Decoder engine built in %.0fs", time.time() - t0)
+        logger.info("Engine: %s", decoder_engine)
 
     # ================================================================
     # Step 4: Verify
@@ -183,10 +252,14 @@ def main():
     import tensorrt as trt
 
     rt = trt.Runtime(trt.Logger(trt.Logger.WARNING))
-    for name, path in [
-        ("VAE encode", vae_enc_engine),
-        ("VAE decode", vae_dec_engine),
-    ]:
+    engines_to_verify = []
+    if not args.skip_vae:
+        engines_to_verify.append(("VAE encode", vae_enc_engine))
+        engines_to_verify.append(("VAE decode", vae_dec_engine))
+    if args.decoder and decoder_engine:
+        engines_to_verify.append(("Decoder (refit)", decoder_engine))
+
+    for name, path in engines_to_verify:
         with open(path, "rb") as f:
             engine = rt.deserialize_cuda_engine(f.read())
         if engine is None:

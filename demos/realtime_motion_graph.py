@@ -8,13 +8,16 @@ Usage:
     uv run python demos/realtime_motion_graph.py --midi [audio_file]     # MIDI knobs
     uv run python demos/realtime_motion_graph.py --midi --sde            # MIDI + SDE curves
     uv run python demos/realtime_motion_graph.py --vae-window 15         # windowed decode
+    uv run python demos/realtime_motion_graph.py --lora --midi           # with LoRA (K5=strength)
 
 Controls:
     ESC = quit
 
 MIDI knob layout (K1-K5, CC#70-74):
-    Regular:  denoise  seed  feedback  shift
-    SDE:      sde_amp  seed  feedback  shift  periodicity
+    Regular:       denoise  seed  feedback  shift
+    SDE:           sde_amp  seed  feedback  shift  periodicity
+    --lora:        denoise  seed  feedback  shift  lora_strength
+    --lora --sde:  sde_amp  seed  feedback  shift  lora_strength
 """
 
 import sys
@@ -41,6 +44,7 @@ from acestep.nodes.types import Audio
 
 PROJECT_ROOT = Path(__file__).parent.parent
 DEFAULT_AUDIO = PROJECT_ROOT / "tests/fixtures" / "new_order_confusion_60seconds.wav"
+LORA_PATH = r"C:\_dev\models\comfyui_models\loras\acestep1.5\deathsteap_1.safetensors"
 
 SAMPLE_RATE = 48000
 T = 1500  # 60s at 25fps
@@ -60,11 +64,12 @@ class KnobDef:
     max_val: float = 1.0
 
 
-def knob_layout(sde: bool) -> dict[str, KnobDef]:
+def knob_layout(sde: bool, lora: bool = False) -> dict[str, KnobDef]:
     """Return the active knob layout for the given mode.
 
-    K1=CC70  K2=CC71  K3=CC72  K4=CC73  K5=CC74
+    K1=CC70  K2=CC71  K3=CC72  K4=CC73  K5=CC74  (K6=CC75)
     Shared knobs first (seed, feedback, shift), mode-specific at edges.
+    When both --lora and --sde: periodicity=K5, lora_strength=K6.
     """
     knobs = {}
     # K1: primary control
@@ -76,21 +81,25 @@ def knob_layout(sde: bool) -> dict[str, KnobDef]:
     knobs["seed"] = KnobDef(cc=71, sensitivity=0.5)
     knobs["feedback"] = KnobDef(cc=72, sensitivity=2.0)
     knobs["shift"] = KnobDef(cc=73, default=0.5, sensitivity=1.0)
-    # K5: SDE only
+    # K5+: mode-specific
     if sde:
-        knobs["periodicity"] = KnobDef(cc=74, sensitivity=2.0)
+        knobs["periodicity"] = KnobDef(cc=74, sensitivity=2.0, max_val=12.5)
+    if lora:
+        cc = 75 if sde else 74  # K6 if sde takes K5, else K5
+        knobs["lora_strength"] = KnobDef(cc=cc, default=0.5, sensitivity=2.0, max_val=2.0)
     return knobs
 
 
 # Colors for graph lines (auto-looked-up by parameter name)
 GRAPH_COLORS = {
-    "denoise":     (0, 255, 0),
-    "sde_amp":     (0, 255, 0),
-    "seed":        (255, 180, 0),
-    "feedback":    (0, 200, 255),
-    "shift":       (180, 0, 255),
-    "periodicity": (255, 100, 100),
-    "motion":      (0, 255, 0),
+    "denoise":        (0, 255, 0),
+    "sde_amp":        (0, 255, 0),
+    "seed":           (255, 180, 0),
+    "feedback":       (0, 200, 255),
+    "shift":          (180, 0, 255),
+    "periodicity":    (60, 40, 60),
+    "lora_strength":  (255, 50, 200),
+    "motion":         (0, 255, 0),
 }
 
 
@@ -289,7 +298,7 @@ class MidiKnobs:
 # HUD drawing
 # ---------------------------------------------------------------------------
 
-def draw_hud(frame, audio_eng, params, histories, motion=0.0, sde_curve_np=None):
+def draw_hud(frame, audio_eng, params, histories, motion=0.0, sde_curve_np=None, knob_maxes=None, knob_order=None):
     """Draw heads-up display. All active parameters render automatically."""
     h, w = frame.shape[:2]
 
@@ -309,11 +318,13 @@ def draw_hud(frame, audio_eng, params, histories, motion=0.0, sde_curve_np=None)
                 f"gen #{params.get('num_gens', 0)}  tick={params.get('tick_ms', 0):.0f}ms  dec={params.get('dec_ms', 0):.0f}ms",
                 (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-    # Parameter line (auto-generated from all non-timing params)
+    # Parameter line in knob order (K1..KN)
     timing_keys = {"num_gens", "tick_ms", "dec_ms"}
+    param_keys = knob_order if knob_order else [k for k in params if k not in timing_keys]
     parts = []
-    for k, v in params.items():
-        if k in timing_keys:
+    for k in param_keys:
+        v = params.get(k)
+        if v is None:
             continue
         if isinstance(v, int):
             parts.append(f"{k}={v}")
@@ -330,16 +341,23 @@ def draw_hud(frame, audio_eng, params, histories, motion=0.0, sde_curve_np=None)
     gx, gy = 10, 65
     gw, gh = w - 40, h - 90
 
-    # History lines (one per tracked parameter)
-    for name, hist in histories.items():
+    # History lines (one per tracked parameter, normalized to knob max)
+    # Draw periodicity first so it sits behind everything else.
+    if knob_maxes is None:
+        knob_maxes = {}
+    draw_order = sorted(histories.keys(), key=lambda n: 0 if n == "periodicity" else 1)
+    for name in draw_order:
+        hist = histories[name]
         if len(hist) < 2:
             continue
         color = GRAPH_COLORS.get(name, (255, 255, 255))
+        max_val = knob_maxes.get(name, 1.0)
         n = min(len(hist), gw)
         pts = []
         for i in range(n):
             x = gx + i
-            y = gy + gh - int(hist[-(n - i)] * gh)
+            v = hist[-(n - i)] / max_val if max_val > 0 else 0.0
+            y = gy + gh - int(min(v, 1.0) * gh)
             pts.append((x, y))
         for a, b in zip(pts, pts[1:]):
             cv2.line(frame, a, b, color, 1)
@@ -366,6 +384,7 @@ def main():
     audio_path = DEFAULT_AUDIO
     use_midi = False
     use_sde = False
+    use_lora = False
     vae_window = 0.0
     args = list(sys.argv[1:])
     if "--midi" in args:
@@ -374,6 +393,9 @@ def main():
     if "--sde" in args:
         use_sde = True
         args.remove("--sde")
+    if "--lora" in args:
+        use_lora = True
+        args.remove("--lora")
     if "--vae-window" in args:
         idx = args.index("--vae-window")
         vae_window = float(args[idx + 1])
@@ -381,7 +403,7 @@ def main():
     if args:
         audio_path = Path(args[0])
 
-    knobs = knob_layout(use_sde)
+    knobs = knob_layout(use_sde, lora=use_lora)
     k1_name = "sde_amp" if use_sde else "denoise"
 
     print("=" * 60)
@@ -391,8 +413,9 @@ def main():
     # ------------------------------------------------------------------
     # Setup
     # ------------------------------------------------------------------
+    decoder_engine = "decoder_mixed_refit_b8_s1500.engine" if use_lora else "decoder_mixed_b8_s1500.engine"
     trt_engines = {
-        "decoder": str(PROJECT_ROOT / "trt_engines" / "decoder_mixed_b8_s1500.engine"),
+        "decoder": str(PROJECT_ROOT / "trt_engines" / decoder_engine),
         "vae_encode": str(PROJECT_ROOT / "trt_engines" / "vae_encode_fp16_max6000.engine"),
         "vae_decode": str(PROJECT_ROOT / "trt_engines" / "vae_decode_fp16_max6000.engine"),
     }
@@ -406,6 +429,18 @@ def main():
         vae_window=vae_window,
     )
     print(f"  Model loaded in {time.time()-t0:.1f}s")
+
+    lora_id = None
+    if use_lora:
+        engine_obj = session.handler._diffusion_engine
+        if engine_obj is not None and engine_obj.trt_lora_available:
+            print(f"[Setup] Applying LoRA: {Path(LORA_PATH).name}")
+            t0 = time.time()
+            lora_id = engine_obj.apply_trt_lora(LORA_PATH, strength=0.5)
+            print(f"  LoRA applied (id={lora_id}) in {time.time()-t0:.1f}s")
+        else:
+            print("[Setup] WARNING: --lora requested but TRT LoRA refit not available")
+            use_lora = False
 
     print("[Setup] Loading source audio...")
     data, sr = sf.read(str(audio_path), dtype="float32")
@@ -452,7 +487,7 @@ def main():
     midi_knobs = None
     if use_midi:
         midi_knobs = MidiKnobs(knobs)
-        disp_w, disp_h = 640, 480
+        disp_w, disp_h = 960, 720
     else:
         tracker = MotionTracker()
         test_ok, test_frame = tracker.cap.read()
@@ -460,6 +495,7 @@ def main():
             print("Cannot open webcam")
             return
         disp_h, disp_w = test_frame.shape[:2]
+        disp_w, disp_h = int(disp_w * 1.5), int(disp_h * 1.5)
 
     pygame.init()
     mode_str = "MIDI" + (" SDE" if use_sde else "") if use_midi else "Webcam"
@@ -487,6 +523,8 @@ def main():
     params["seed"] = SEED
     params["feedback"] = 0.0
     params["shift"] = 3.0
+    if use_lora:
+        params["lora_strength"] = 0.5
     if use_sde:
         params["periodicity"] = 0.0
 
@@ -521,6 +559,12 @@ def main():
             if abs(shift_val - stream.config.shift) > 0.05:
                 stream.set_shift(shift_val)
 
+            # LoRA strength: apply refit when knob changes
+            if use_lora and lora_id is not None:
+                lora_str = raw.get("lora_strength", 0.5)
+                if abs(lora_str - params.get("lora_strength", -1)) > 0.02:
+                    engine_obj.set_trt_lora_strength(lora_id, lora_str)
+
             # Latent feedback: blend last output into source
             source_lat = None
             if feedback > 0.0 and last_latent is not None:
@@ -537,7 +581,7 @@ def main():
                 periodicity = raw.get("periodicity", 0.0)
 
                 if periodicity > 0.01:
-                    cycles = 0.5 + periodicity * 7.5
+                    cycles = periodicity * (T / 25.0)
                     t = torch.linspace(0, 1, T).unsqueeze(0).unsqueeze(-1)
                     sde_curve = amplitude * (0.5 + 0.5 * torch.sin(2 * 3.14159 * cycles * t))
                 else:
@@ -620,6 +664,8 @@ def main():
                 params["seed"] = seed
                 params["feedback"] = round(feedback, 2)
                 params["shift"] = round(shift_val, 2)
+                if use_lora:
+                    params["lora_strength"] = round(raw.get("lora_strength", 0.5), 2)
                 if use_sde:
                     params["periodicity"] = round(raw.get("periodicity", 0.0), 2)
 
@@ -634,6 +680,8 @@ def main():
     else:
         histories = {"motion": []}
     max_history = 600
+    knob_maxes = {name: k.max_val for name, k in knobs.items()}
+    knob_order = list(knobs.keys())
 
     try:
         while True:
@@ -647,6 +695,7 @@ def main():
                 frame, motion = tracker.read_latest()
                 if frame is None:
                     break
+                frame = cv2.resize(frame, (disp_w, disp_h))
             else:
                 motion = midi_knobs.get(k1_name)
                 frame = np.zeros((disp_h, disp_w, 3), dtype=np.uint8)
@@ -666,7 +715,8 @@ def main():
                     del hist[:-max_history]
 
             draw_hud(frame, audio_eng, params, histories,
-                     motion=motion, sde_curve_np=sde_curve_display[0])
+                     motion=motion, sde_curve_np=sde_curve_display[0],
+                     knob_maxes=knob_maxes, knob_order=knob_order)
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             surf = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))

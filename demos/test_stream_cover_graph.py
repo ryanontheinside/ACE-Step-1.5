@@ -35,7 +35,10 @@ OUTPUT_FILE = OUTPUT_DIR / "stream_cover_graph_backend.wav"
 SAMPLE_RATE = 48000
 SEED = 1528
 
-TRT_ENGINE = PROJECT_ROOT / "trt_engines" / "decoder_mixed_b8_s1500.engine"
+TRT_ENGINE_DEFAULT = PROJECT_ROOT / "trt_engines" / "decoder_mixed_b8_s1500.engine"
+TRT_ENGINE_REFIT = PROJECT_ROOT / "trt_engines" / "decoder_mixed_refit_b8_s1500.engine"
+LORA_PATH = r"C:\_dev\models\comfyui_models\loras\acestep1.5\deathsteap_1.safetensors"
+LORA_STRENGTH = 1.0
 
 # CLI flags
 _args = sys.argv[1:]
@@ -43,6 +46,8 @@ vae_window = 0.0
 if "--vae-window" in _args:
     _idx = _args.index("--vae-window")
     vae_window = float(_args[_idx + 1])
+use_lora = "--lora" in _args
+TRT_ENGINE = TRT_ENGINE_REFIT if use_lora else TRT_ENGINE_DEFAULT
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +108,15 @@ with timed("model_load"):
         },
         vae_window=vae_window,
     )
+
+if use_lora:
+    engine_obj = session.handler._diffusion_engine
+    if engine_obj is not None and engine_obj.trt_lora_available:
+        with timed("apply_lora"):
+            print(f"[Setup] Applying LoRA: {Path(LORA_PATH).name} (strength={LORA_STRENGTH})")
+            engine_obj.apply_trt_lora(LORA_PATH, strength=LORA_STRENGTH)
+    else:
+        print("[Setup] WARNING: --lora requested but TRT LoRA refit not available")
 
 with timed("load_audio"):
     print("[Setup] Loading source audio...")
