@@ -27,7 +27,7 @@ from acestep.engine.diffusion import DiffusionConfig
 from acestep.engine.stream import StreamPipeline, SlotRequest
 from acestep.nodes.types import Latent
 from acestep.nodes.vae_nodes import (
-    _get_trt_vae, _get_trt_stream, _find_trt_engine,
+    _get_trt_vae, _get_trt_stream, _find_trt_engine, _find_best_vae_engine,
 )
 
 TRT_ENGINES = {
@@ -92,23 +92,39 @@ for i in range(config.infer_steps):
     if result is not None:
         warmup_latent = result
 
-vae_decode_path = _find_trt_engine("vae_decode_fp16_max6000.engine")
-vae_entry = _get_trt_vae(vae_decode_path, torch.device(device))
+# -----------------------------------------------------------------------
+# Discover VAE decode engines (FP16 and optionally INT8)
+# -----------------------------------------------------------------------
 shared_stream = _get_trt_stream()
 
-# Warm VAE decode
+vae_fp16_path = _find_trt_engine("vae_decode_fp16_max6000.engine") or _find_trt_engine("vae_decode_fp16.engine")
+vae_int8_path = _find_trt_engine("vae_decode_int8.engine")
+
+vae_engines = {}  # tag -> (path, entry)
 lat_bdt = warmup_latent.transpose(1, 2)
-for _ in range(3):
-    lat = lat_bdt.to(device=torch.device(device), dtype=torch.float32).contiguous()
-    vae_ctx = vae_entry["context"]
-    vae_ctx.set_input_shape("latents", tuple(lat.shape))
-    vae_ctx.set_tensor_address("latents", lat.data_ptr())
-    out_shape = tuple(vae_ctx.get_tensor_shape("audio"))
-    audio_buf = torch.empty(out_shape, dtype=torch.float32, device=torch.device(device))
-    vae_entry["_decode_buf"] = audio_buf
-    vae_ctx.set_tensor_address("audio", audio_buf.data_ptr())
-    vae_ctx.execute_async_v3(shared_stream.ptr)
-    shared_stream.synchronize()
+
+for tag, path in [("FP16", vae_fp16_path), ("INT8", vae_int8_path)]:
+    if path is None:
+        print(f"[Setup] VAE decode {tag}: not found, skipping")
+        continue
+    print(f"[Setup] VAE decode {tag}: {path}")
+    vae_eng = _get_trt_vae(path, torch.device(device))
+    # Warm up
+    for _ in range(3):
+        lat = lat_bdt.to(device=torch.device(device), dtype=torch.float32).contiguous()
+        ctx = vae_eng["context"]
+        ctx.set_input_shape("latents", tuple(lat.shape))
+        ctx.set_tensor_address("latents", lat.data_ptr())
+        out_shape = tuple(ctx.get_tensor_shape("audio"))
+        audio_buf = torch.empty(out_shape, dtype=torch.float32, device=torch.device(device))
+        vae_eng["_decode_buf"] = audio_buf
+        ctx.set_tensor_address("audio", audio_buf.data_ptr())
+        ctx.execute_async_v3(shared_stream.ptr)
+        shared_stream.synchronize()
+    vae_engines[tag] = (path, vae_eng)
+
+# For backward compat with the rest of the script (tick profiling uses this)
+vae_entry = list(vae_engines.values())[0][1]
 
 torch.cuda.synchronize()
 print("[Setup] Ready.\n")
@@ -149,7 +165,7 @@ class Profiler:
             total_avg += avg
             mn, mx = min(vals), max(vals)
             print(f"  {label:40s}  avg={avg:7.2f}ms  min={mn:6.2f}  max={mx:6.2f}")
-        print(f"  {'─' * 60}")
+        print(f"  {'-' * 60}")
         print(f"  {'TOTAL':40s}  avg={total_avg:7.2f}ms")
         return total_avg
 
@@ -255,16 +271,12 @@ for iteration in range(N):
             bufs["encoder_hidden_states"][i, L:, :].zero_()
     prof.stop()
 
-    # fill context_latents
+    # fill context_latents (per-slot copy, no cat+to intermediates)
     prof.start("tick.fill_context_lat")
-    ctx_batch = torch.cat(
-        [s.request.context_latents for s in slots], dim=0
-    ).to(io_dtype)
+    for i, s in enumerate(slots):
+        bufs["context_latents"][i, :T_val, :].copy_(s.request.context_latents[0, :T_val])
     if pad:
-        bufs["context_latents"][:, :T_val, :].copy_(ctx_batch)
         bufs["context_latents"][:, T_val:, :].zero_()
-    else:
-        bufs["context_latents"].copy_(ctx_batch)
     prof.stop()
 
     # rebind addresses
@@ -313,13 +325,8 @@ tick_total = prof.report("TICK BREAKDOWN", tick_labels)
 
 
 # -----------------------------------------------------------------------
-# DECODE BREAKDOWN
+# DECODE BREAKDOWN (per-engine)
 # -----------------------------------------------------------------------
-print(f"\n\n{'=' * 70}")
-print("PROFILING VAE DECODE (instrumented _trt_vae_decode)")
-print("=" * 70)
-
-dec_prof = Profiler()
 
 dec_labels = [
     "dec.transpose_input",
@@ -335,84 +342,97 @@ dec_labels = [
     "dec.to_cpu_float",
 ]
 
-# Use the same latent each iteration (shape doesn't change)
 test_latent = warmup_latent.clone()
+dec_profilers = {}  # tag -> (Profiler, total_ms)
+dec_raw_times = {}  # tag -> avg raw ms
 
-for iteration in range(N):
-    vae_ctx = vae_entry["context"]
+for tag, (engine_path, engine_entry) in vae_engines.items():
+    print(f"\n\n{'=' * 70}")
+    print(f"PROFILING VAE DECODE [{tag}] (instrumented _trt_vae_decode)")
+    print(f"{'=' * 70}")
 
-    # transpose
-    dec_prof.start("dec.transpose_input")
-    lat_bdt_i = test_latent.transpose(1, 2)
-    dec_prof.stop()
+    dec_prof = Profiler()
 
-    # to fp32 contiguous
-    dec_prof.start("dec.to_fp32_contiguous")
-    lat = lat_bdt_i.to(device=torch.device(device), dtype=torch.float32).contiguous()
-    dec_prof.stop()
+    for iteration in range(N):
+        vae_ctx = engine_entry["context"]
 
-    # set input shape
-    dec_prof.start("dec.set_input_shape")
-    vae_ctx.set_input_shape("latents", tuple(lat.shape))
-    dec_prof.stop()
+        dec_prof.start("dec.transpose_input")
+        lat_bdt_i = test_latent.transpose(1, 2)
+        dec_prof.stop()
 
-    # set input address
-    dec_prof.start("dec.set_input_addr")
-    vae_ctx.set_tensor_address("latents", lat.data_ptr())
-    dec_prof.stop()
+        dec_prof.start("dec.to_fp32_contiguous")
+        lat = lat_bdt_i.to(device=torch.device(device), dtype=torch.float32).contiguous()
+        dec_prof.stop()
 
-    # get output shape
-    dec_prof.start("dec.get_output_shape")
-    out_shape = tuple(vae_ctx.get_tensor_shape("audio"))
-    dec_prof.stop()
+        dec_prof.start("dec.set_input_shape")
+        vae_ctx.set_input_shape("latents", tuple(lat.shape))
+        dec_prof.stop()
 
-    # alloc or reuse buffer
-    dec_prof.start("dec.alloc_or_reuse_buf")
-    cached = vae_entry.get("_decode_buf")
-    if cached is not None and cached.shape == out_shape:
-        audio_buf = cached
-    else:
-        audio_buf = torch.empty(out_shape, dtype=torch.float32, device=torch.device(device))
-        vae_entry["_decode_buf"] = audio_buf
-    dec_prof.stop()
+        dec_prof.start("dec.set_input_addr")
+        vae_ctx.set_tensor_address("latents", lat.data_ptr())
+        dec_prof.stop()
 
-    # set output address
-    dec_prof.start("dec.set_output_addr")
-    vae_ctx.set_tensor_address("audio", audio_buf.data_ptr())
-    dec_prof.stop()
+        dec_prof.start("dec.get_output_shape")
+        out_shape = tuple(vae_ctx.get_tensor_shape("audio"))
+        dec_prof.stop()
 
-    # execute async
-    dec_prof.start("dec.execute_async")
-    vae_ctx.execute_async_v3(shared_stream.ptr)
-    dec_prof.stop()
+        dec_prof.start("dec.alloc_or_reuse_buf")
+        cached = engine_entry.get("_decode_buf")
+        if cached is not None and cached.shape == out_shape:
+            audio_buf = cached
+        else:
+            audio_buf = torch.empty(out_shape, dtype=torch.float32, device=torch.device(device))
+            engine_entry["_decode_buf"] = audio_buf
+        dec_prof.stop()
 
-    # stream sync
-    dec_prof.start("dec.stream_sync")
-    shared_stream.synchronize()
-    dec_prof.stop()
+        dec_prof.start("dec.set_output_addr")
+        vae_ctx.set_tensor_address("audio", audio_buf.data_ptr())
+        dec_prof.stop()
 
-    # clone output
-    dec_prof.start("dec.clone_output")
-    result_audio = audio_buf.clone()
-    dec_prof.stop()
+        dec_prof.start("dec.execute_async")
+        vae_ctx.execute_async_v3(shared_stream.ptr)
+        dec_prof.stop()
 
-    # to cpu float (what session.decode does next: .detach().cpu().float())
-    dec_prof.start("dec.to_cpu_float")
-    wav = result_audio.detach().cpu().float()
-    dec_prof.stop()
+        dec_prof.start("dec.stream_sync")
+        shared_stream.synchronize()
+        dec_prof.stop()
 
-dec_total = dec_prof.report("DECODE BREAKDOWN", dec_labels)
+        dec_prof.start("dec.clone_output")
+        result_audio = audio_buf.clone()
+        dec_prof.stop()
+
+        dec_prof.start("dec.to_cpu_float")
+        wav = result_audio.detach().cpu().float()
+        dec_prof.stop()
+
+    dec_total = dec_prof.report(f"DECODE BREAKDOWN [{tag}]", dec_labels)
+    dec_profilers[tag] = (dec_prof, dec_total)
+
+    # Raw engine isolation for this engine
+    print(f"\n  Raw {tag} (execute + sync only, 60s audio):")
+    raw_times = []
+    for _ in range(N):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        engine_entry["context"].execute_async_v3(shared_stream.ptr)
+        shared_stream.synchronize()
+        raw_times.append((time.perf_counter() - t0) * 1000)
+    avg_raw = sum(raw_times) / len(raw_times)
+    print(f"    avg={avg_raw:.2f}ms  min={min(raw_times):.2f}  max={max(raw_times):.2f}")
+    dec_raw_times[tag] = avg_raw
+
+# Use first engine's profiler for combined stats
+first_tag = list(dec_profilers.keys())[0]
+dec_prof, dec_total = dec_profilers[first_tag]
 
 
 # -----------------------------------------------------------------------
-# RAW ENGINE ISOLATION: just execute + sync, nothing else
+# RAW ENGINE ISOLATION: DiT
 # -----------------------------------------------------------------------
 print(f"\n\n{'=' * 70}")
 print("RAW ENGINE ISOLATION (execute_async + sync only, no prep)")
 print("=" * 70)
 
-# DiT engine: buffers are already filled from the last instrumented tick.
-# Just slam execute + sync repeatedly.
 print("\n  DiT decoder (buffers pre-filled, B=8, T=1500):")
 dit_raw = []
 for _ in range(N):
@@ -425,23 +445,44 @@ for _ in range(N):
 avg_dit_raw = sum(dit_raw) / len(dit_raw)
 print(f"    avg={avg_dit_raw:.2f}ms  min={min(dit_raw):.2f}  max={max(dit_raw):.2f}")
 
-# VAE decoder: buffers already filled from last instrumented decode.
-print("\n  VAE decoder (buffers pre-filled, 60s audio):")
-vae_raw = []
-for _ in range(N):
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    vae_entry["context"].execute_async_v3(shared_stream.ptr)
-    shared_stream.synchronize()
-    vae_raw.append((time.perf_counter() - t0) * 1000)
+for tag, avg_raw in dec_raw_times.items():
+    print(f"\n  VAE decode [{tag}] raw:  avg={avg_raw:.2f}ms")
+    print(f"  Sequential raw ceiling (DiT + {tag}): {avg_dit_raw + avg_raw:.2f}ms")
 
-avg_vae_raw = sum(vae_raw) / len(vae_raw)
-print(f"    avg={avg_vae_raw:.2f}ms  min={min(vae_raw):.2f}  max={max(vae_raw):.2f}")
 
-# Both sequential: raw ceiling
-print(f"\n  Sequential raw ceiling: {avg_dit_raw + avg_vae_raw:.2f}ms")
-print(f"  vs instrumented total:  {tick_total + dec_total:.1f}ms")
-print(f"  Overhead outside TRT:   {tick_total + dec_total - avg_dit_raw - avg_vae_raw:.1f}ms")
+# -----------------------------------------------------------------------
+# FP16 vs INT8 COMPARISON
+# -----------------------------------------------------------------------
+if len(dec_raw_times) >= 2 and "FP16" in dec_raw_times and "INT8" in dec_raw_times:
+    print(f"\n\n{'=' * 70}")
+    print("FP16 vs INT8 VAE DECODE COMPARISON")
+    print("=" * 70)
+
+    fp16_raw = dec_raw_times["FP16"]
+    int8_raw = dec_raw_times["INT8"]
+    speedup = fp16_raw / int8_raw if int8_raw > 0 else float("inf")
+
+    fp16_total = dec_profilers["FP16"][1]
+    int8_total = dec_profilers["INT8"][1]
+    speedup_total = fp16_total / int8_total if int8_total > 0 else float("inf")
+
+    print(f"\n  Raw kernel execution (execute + sync):")
+    print(f"    FP16:  {fp16_raw:7.2f}ms")
+    print(f"    INT8:  {int8_raw:7.2f}ms")
+    print(f"    Speedup: {speedup:.2f}x")
+
+    print(f"\n  Full decode (with prep + copy overhead):")
+    print(f"    FP16:  {fp16_total:7.2f}ms")
+    print(f"    INT8:  {int8_total:7.2f}ms")
+    print(f"    Speedup: {speedup_total:.2f}x")
+
+    saved_ms = fp16_raw - int8_raw
+    print(f"\n  Time saved per decode: {saved_ms:.1f}ms")
+    print(f"  For 60s gen (8 ticks + 1 decode):")
+    fp16_gen = avg_dit_raw * 8 + fp16_raw
+    int8_gen = avg_dit_raw * 8 + int8_raw
+    print(f"    FP16 total: {fp16_gen:.0f}ms")
+    print(f"    INT8 total: {int8_gen:.0f}ms")
 
 
 # -----------------------------------------------------------------------
@@ -472,7 +513,7 @@ print(f"\n\n{'=' * 70}")
 print("FINAL SUMMARY")
 print("=" * 70)
 
-# Find top contributors
+# Find top contributors (tick + first decode engine)
 all_items = []
 for label in tick_labels:
     vals = prof.data.get(label, [])
@@ -485,7 +526,7 @@ for label in dec_labels:
 
 all_items.sort(key=lambda x: x[1], reverse=True)
 
-print(f"\n  Top contributors (tick + decode combined):")
+print(f"\n  Top contributors (tick + {first_tag} decode):")
 cumulative = 0
 for label, avg in all_items:
     cumulative += avg
@@ -498,15 +539,22 @@ for label, avg in all_items:
         break
 
 print(f"\n  Tick total:   {tick_total:.1f}ms")
-print(f"  Decode total: {dec_total:.1f}ms")
+print(f"  Decode total ({first_tag}): {dec_total:.1f}ms")
 print(f"  Combined:     {tick_total + dec_total:.1f}ms")
 
+avg_vae_raw = dec_raw_times[first_tag]
 combined = tick_total + dec_total
 raw_combined = avg_dit_raw + avg_vae_raw
 overhead_ms = combined - raw_combined
 
-print(f"\n  Raw TRT execution:    {raw_combined:.1f}ms  (DiT={avg_dit_raw:.1f} + VAE={avg_vae_raw:.1f})")
+print(f"\n  Raw TRT execution:    {raw_combined:.1f}ms  (DiT={avg_dit_raw:.1f} + VAE {first_tag}={avg_vae_raw:.1f})")
 print(f"  Instrumented total:   {combined:.1f}ms")
 print(f"  Non-TRT overhead:     {overhead_ms:.1f}ms  ({overhead_ms/combined*100:.0f}%)")
+
+# Per-engine summary
+if len(dec_raw_times) >= 2:
+    print(f"\n  VAE decode raw kernel times:")
+    for tag, raw in dec_raw_times.items():
+        print(f"    {tag}: {raw:.2f}ms")
 
 print(f"\n{'=' * 70}")

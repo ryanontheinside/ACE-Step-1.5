@@ -209,7 +209,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
-tests/
+_debug_tests/
 checkpoints/
 playground.ipynb
 .history/
