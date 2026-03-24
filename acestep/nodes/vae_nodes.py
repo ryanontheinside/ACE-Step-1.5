@@ -145,6 +145,23 @@ def _find_trt_engine(name: str) -> Optional[str]:
     return None
 
 
+def _find_best_vae_engine(component: str) -> Optional[str]:
+    """Find the best available VAE TRT engine (FP16 only).
+
+    Args:
+        component: "vae_decode" or "vae_encode"
+    """
+    candidates = [
+        f"{component}_fp16.engine",
+        f"{component}_fp16_max6000.engine",
+    ]
+    for name in candidates:
+        path = _find_trt_engine(name)
+        if path:
+            return path
+    return None
+
+
 
 # -----------------------------------------------------------------------
 # Nodes
@@ -188,7 +205,7 @@ class VAEEncodeAudio(BaseNode):
         if waveform.dim() == 2:
             waveform = waveform.unsqueeze(0)
 
-        trt_path = _find_trt_engine("vae_encode_fp16_max6000.engine") if _trt_available() else None
+        trt_path = _find_best_vae_engine("vae_encode") if _trt_available() else None
         if trt_path:
             logger.info("VAE encode via TRT")
             latents_bdt = _trt_vae_encode(waveform, trt_path, device)
@@ -239,7 +256,7 @@ class VAEDecodeAudio(BaseNode):
         # [B, T, D] -> [B, D, T]
         lat_bdt = latent.tensor.transpose(1, 2)
 
-        trt_path = _find_trt_engine("vae_decode_fp16_max6000.engine") if _trt_available() else None
+        trt_path = _find_best_vae_engine("vae_decode") if _trt_available() else None
         if trt_path:
             logger.info("VAE decode via TRT")
             waveform = _trt_vae_decode(lat_bdt, trt_path, device)
