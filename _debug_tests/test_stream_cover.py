@@ -48,6 +48,13 @@ SEED = 1528  # fixed seed so output is stable when params don't change
 
 TRT_ENGINE = PROJECT_ROOT / "trt_engines" / "decoder_mixed_b8_s1500.engine"
 
+# CLI flags
+_args = sys.argv[1:]
+vae_window = 0.0
+if "--vae-window" in _args:
+    _idx = _args.index("--vae-window")
+    vae_window = float(_args[_idx + 1])
+
 
 # ---------------------------------------------------------------------------
 # Timing helper
@@ -106,6 +113,7 @@ with timed("model_load"):
             "vae_encode": str(VAE_ENCODE_ENGINE),
             "vae_decode": str(VAE_DECODE_ENGINE),
         },
+        vae_window=vae_window,
     )
 
 handler = session.handler
@@ -190,6 +198,7 @@ last_wav = None
 skip_threshold = 1e-3
 num_skipped = 0
 mse_values = []
+last_win_start_sample = 0
 
 print(f"\n[Run] Starting pipeline (decode inline, {slice_duration}s slices, skip_threshold={skip_threshold})...")
 run_start = time.time()
@@ -226,15 +235,24 @@ for tick_num in range(total_ticks):
         else:
             dn_submitted = -1.0
 
+        # Absolute playback position in the 60s song
+        start = playback_offset_samples + num_completed * slice_samples
+        end = start + slice_samples
+
         # Similarity check: skip decode if latent barely changed
+        # and the cached waveform still covers the current playback slice
         skipped = False
         if last_latent is not None:
             mse = (result - last_latent).pow(2).mean().item()
             mse_values.append(mse)
             if mse < skip_threshold and last_wav is not None:
-                wav = last_wav
-                skipped = True
-                num_skipped += 1
+                # Check the cached waveform covers the current slice
+                local_start = start - last_win_start_sample
+                local_end = local_start + slice_samples
+                if 0 <= local_start and local_end <= last_wav.shape[1]:
+                    wav = last_wav
+                    skipped = True
+                    num_skipped += 1
 
         # Always update last_latent so comparisons are consecutive,
         # not against a stale reference from many ticks ago
@@ -242,23 +260,31 @@ for tick_num in range(total_ticks):
 
         if not skipped:
             dec_t0 = time.perf_counter()
-            audio_out = session.decode(Latent(tensor=result))
+            if vae_window > 0:
+                # Windowed: decode only around the playback position
+                t_start = start / SAMPLE_RATE
+                audio_out = session.decode(Latent(tensor=result), t_start=t_start)
+                wav = audio_out.waveform.detach().cpu().float().squeeze(0)
+                win_start_sample = audio_out.start_sample
+            else:
+                audio_out = session.decode(Latent(tensor=result))
+                wav = audio_out.waveform.detach().cpu().float().squeeze(0)
+                win_start_sample = 0
             torch.cuda.synchronize()
             dec_ms = (time.perf_counter() - dec_t0) * 1000
             timings.setdefault("vae_decode", []).append(dec_ms)
-            wav = audio_out.waveform.detach().cpu().float().squeeze(0)
             last_wav = wav
+            last_win_start_sample = win_start_sample
+            local_start = start - win_start_sample
+            local_end = local_start + slice_samples
 
-        start = playback_offset_samples + num_completed * slice_samples
-        end = start + slice_samples
-
-        if end <= wav.shape[1]:
-            chunk = wav[:, start:end]
+        if local_end <= wav.shape[1]:
+            chunk = wav[:, local_start:local_end]
         else:
             chunk = torch.zeros(wav.shape[0], slice_samples)
-            available = wav.shape[1] - start
+            available = wav.shape[1] - local_start
             if available > 0:
-                chunk[:, :available] = wav[:, start:start+available]
+                chunk[:, :available] = wav[:, local_start:local_start+available]
 
         output_chunks.append(chunk)
         num_completed += 1

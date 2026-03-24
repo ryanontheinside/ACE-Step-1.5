@@ -99,6 +99,7 @@ class Audio:
     TYPE_NAME: ClassVar[str] = "AUDIO"
     waveform: torch.Tensor  # [B, channels, samples]
     sample_rate: int = 48000
+    start_sample: int = 0  # sample offset into the full signal (for windowed decode)
 
 
 @_register

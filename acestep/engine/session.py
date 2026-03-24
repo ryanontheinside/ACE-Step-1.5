@@ -88,6 +88,8 @@ class Session:
         offload_to_cpu: bool = False,
         quantization: Optional[str] = None,
         trt_engines: Optional[dict[str, str]] = None,
+        vae_window: float = 0.0,
+        vae_overlap: float = 0.5,
     ):
         import torch
         from acestep.handler import AceStepHandler
@@ -115,6 +117,10 @@ class Session:
         self.model = ModelHandle(handler=handler)
         self.clip = CLIPHandle(handler=handler)
         self.vae = VAEHandle(handler=handler)
+
+        # Windowed VAE decode config (seconds; 0 = full decode)
+        self._vae_window = vae_window
+        self._vae_overlap = vae_overlap
 
         # Wire up TRT engines
         if trt_engines:
@@ -254,11 +260,72 @@ class Session:
     # Decoding
     # ------------------------------------------------------------------
 
-    def decode(self, latent: Latent) -> Audio:
-        """VAE decode latent to audio waveform."""
+    def decode(self, latent: Latent, t_start: float = 0.0) -> Audio:
+        """VAE decode latent to audio waveform.
+
+        Args:
+            latent: Latent to decode.
+            t_start: When ``vae_window`` > 0, the start time (seconds) of
+                the window to decode. The returned Audio contains only
+                the interior of that window (overlap margins are used
+                for context but trimmed from output). Ignored when
+                ``vae_window`` is 0.
+
+        Returns:
+            Audio starting at ``t_start`` with duration ``vae_window``
+            (or the full latent when windowing is off).
+        """
         from acestep.nodes.vae_nodes import VAEDecodeAudio
 
-        return VAEDecodeAudio().execute(vae=self.vae, latent=latent)["audio"]
+        if self._vae_window <= 0:
+            return VAEDecodeAudio().execute(vae=self.vae, latent=latent)["audio"]
+
+        return self._decode_windowed(latent, t_start)
+
+    def _decode_windowed(self, latent: Latent, t_start: float) -> Audio:
+        """Decode a single window of the latent with overlap margins.
+
+        Returns Audio with ``start_seconds`` set to the frame-quantized
+        start time so callers know exactly where the window begins.
+        """
+        import torch
+        from acestep.nodes.vae_nodes import VAEDecodeAudio
+
+        FRAMES_PER_SEC = 25
+        SAMPLES_PER_FRAME = 1920  # 48000 / 25
+
+        tensor = latent.tensor  # [1, T, D]
+        T = tensor.shape[1]
+
+        win_frames = int(self._vae_window * FRAMES_PER_SEC)
+        ovl_frames = int(self._vae_overlap * FRAMES_PER_SEC)
+
+        # If the latent fits in one window, just decode the whole thing
+        if T <= win_frames:
+            return VAEDecodeAudio().execute(vae=self.vae, latent=latent)["audio"]
+
+        # Clamp keep region to valid range (frame-quantized)
+        keep_start = max(0, int(t_start * FRAMES_PER_SEC))
+        keep_end = min(T, keep_start + win_frames)
+        keep_start = max(0, keep_end - win_frames)  # adjust if clamped at end
+
+        # Extend by overlap margins for VAE receptive field context
+        decode_start = max(0, keep_start - ovl_frames)
+        decode_end = min(T, keep_end + ovl_frames)
+
+        # Decode the window
+        chunk_lat = Latent(tensor=tensor[:, decode_start:decode_end, :].contiguous())
+        chunk_audio = VAEDecodeAudio().execute(
+            vae=self.vae, latent=chunk_lat
+        )["audio"]
+
+        # Trim overlap margins, return only the clean interior
+        pre_margin = (keep_start - decode_start) * SAMPLES_PER_FRAME
+        keep_samples = (keep_end - keep_start) * SAMPLES_PER_FRAME
+        trimmed = chunk_audio.waveform[:, :, pre_margin:pre_margin + keep_samples]
+
+        return Audio(waveform=trimmed, sample_rate=48000,
+                     start_sample=keep_start * SAMPLES_PER_FRAME)
 
     # ------------------------------------------------------------------
     # Audio analysis

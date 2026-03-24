@@ -280,6 +280,7 @@ def main():
     audio_path = DEFAULT_AUDIO
     use_midi = False
     use_sde = False
+    vae_window = 0.0
     args = [a for a in sys.argv[1:]]
     if "--midi" in args:
         use_midi = True
@@ -287,6 +288,10 @@ def main():
     if "--sde" in args:
         use_sde = True
         args.remove("--sde")
+    if "--vae-window" in args:
+        idx = args.index("--vae-window")
+        vae_window = float(args[idx + 1])
+        del args[idx:idx + 2]
     if args:
         audio_path = Path(args[0])
 
@@ -309,6 +314,7 @@ def main():
         project_root=str(PROJECT_ROOT / "checkpoints"),
         compile_model=False,
         trt_engines=trt_engines,
+        vae_window=vae_window,
     )
     handler = session.handler
     device, dtype = handler.device, handler.dtype
@@ -484,14 +490,48 @@ def main():
 
                 if not skipped:
                     t1 = time.perf_counter()
-                    audio_out = session.decode(Latent(tensor=result))
-                    torch.cuda.synchronize()
-                    dec_ms = (time.perf_counter() - t1) * 1000
-
-                    wav = audio_out.waveform.detach().cpu().float().squeeze(0)
-                    wav_np = wav.numpy().T
-                    last_wav = wav_np
-                    audio_eng.swap(wav_np)
+                    if vae_window > 0:
+                        # Windowed: decode around playback position, splice
+                        t_pos = audio_eng.position / SAMPLE_RATE
+                        audio_out = session.decode(
+                            Latent(tensor=result), t_start=t_pos,
+                        )
+                        torch.cuda.synchronize()
+                        dec_ms = (time.perf_counter() - t1) * 1000
+                        win_wav = audio_out.waveform.detach().cpu().float().squeeze(0)
+                        win_np = win_wav.numpy().T
+                        # Use quantized start from decoder (not raw t_pos)
+                        win_start = audio_out.start_sample
+                        win_end = win_start + win_np.shape[0]
+                        buf = audio_eng.current.copy()
+                        # Crossfade at splice edges to avoid discontinuities
+                        xfade = min(2400, win_np.shape[0] // 4)  # 50ms
+                        if win_start > 0 and xfade > 0:
+                            t_in = np.linspace(0.0, 1.0, xfade).reshape(-1, 1)
+                            win_np[:xfade] = (
+                                buf[win_start:win_start + xfade] * (1 - t_in)
+                                + win_np[:xfade] * t_in
+                            )
+                        if win_end < buf.shape[0] and xfade > 0:
+                            t_out = np.linspace(1.0, 0.0, xfade).reshape(-1, 1)
+                            tail = min(xfade, buf.shape[0] - win_end + xfade)
+                            s = win_np.shape[0] - tail
+                            win_np[s:] = (
+                                win_np[s:] * t_out[:tail]
+                                + buf[win_start + s:win_start + s + tail] * (1 - t_out[:tail])
+                            )
+                        clamp_end = min(win_end, buf.shape[0])
+                        buf[win_start:clamp_end] = win_np[:clamp_end - win_start]
+                        audio_eng.swap(buf)
+                        last_wav = buf
+                    else:
+                        audio_out = session.decode(Latent(tensor=result))
+                        torch.cuda.synchronize()
+                        dec_ms = (time.perf_counter() - t1) * 1000
+                        wav = audio_out.waveform.detach().cpu().float().squeeze(0)
+                        wav_np = wav.numpy().T
+                        last_wav = wav_np
+                        audio_eng.swap(wav_np)
 
                 stats["num_gens"] += 1
                 stats["tick_ms"] = tick_ms

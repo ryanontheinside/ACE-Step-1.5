@@ -259,7 +259,7 @@ class StreamPipeline:
         eff_T = bufs["_eff_T"]
         pad = T % 2 == 1
 
-        # Fill hidden_states (cast to engine's I/O dtype)
+        # Fill hidden_states (cast to engine's I/O dtype) -- changes every tick
         xt_batch = torch.cat([s.xt for s in slots], dim=0).to(self._trt_io_dtype)
         if pad:
             bufs["hidden_states"][:, :T, :].copy_(xt_batch)
@@ -267,7 +267,7 @@ class StreamPipeline:
         else:
             bufs["hidden_states"].copy_(xt_batch)
 
-        # Fill timesteps (per-slot from their schedules)
+        # Fill timesteps (per-slot from their schedules) -- changes every tick
         for i, s in enumerate(slots):
             bufs["timestep"][i] = s.t_schedule[s.step_idx].item()
 
@@ -280,15 +280,11 @@ class StreamPipeline:
             if L < max_L:
                 bufs["encoder_hidden_states"][i, L:, :].zero_()
 
-        # Fill context_latents
-        ctx_batch = torch.cat(
-            [s.request.context_latents for s in slots], dim=0
-        ).to(io_dtype)
+        # Fill context_latents (per-slot copy avoids cat+to temp allocations)
+        for i, s in enumerate(slots):
+            bufs["context_latents"][i, :T, :].copy_(s.request.context_latents[0, :T])
         if pad:
-            bufs["context_latents"][:, :T, :].copy_(ctx_batch)
             bufs["context_latents"][:, T:, :].zero_()
-        else:
-            bufs["context_latents"].copy_(ctx_batch)
 
         # Rebind addresses and execute
         ctx = self._trt_ctx
