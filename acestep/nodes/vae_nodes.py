@@ -148,12 +148,26 @@ def _find_trt_engine(name: str) -> Optional[str]:
 def _find_best_vae_engine(component: str) -> Optional[str]:
     """Find the best available VAE TRT engine (FP16 only).
 
+    Checks the pre-loaded cache first (engines loaded by Session.__init__),
+    then falls back to filesystem discovery. Prefers max6000 variants over
+    plain fp16 to avoid loading a second, inferior engine that triggers
+    Blackwell multi-engine kernel degradation.
+
     Args:
         component: "vae_decode" or "vae_encode"
     """
+    # 1. Check if an engine for this component is already cached (pre-loaded
+    #    by Session). Using a cached engine avoids loading a second TRT
+    #    context, which causes 20-100x kernel slowdown on Blackwell GPUs.
+    for cached_path in _trt_vae_cache:
+        basename = os.path.basename(cached_path).lower()
+        if basename.startswith(component):
+            return cached_path
+
+    # 2. Filesystem discovery (prefer larger-capacity engines first)
     candidates = [
-        f"{component}_fp16.engine",
         f"{component}_fp16_max6000.engine",
+        f"{component}_fp16.engine",
     ]
     for name in candidates:
         path = _find_trt_engine(name)
