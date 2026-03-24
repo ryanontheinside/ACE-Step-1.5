@@ -1,6 +1,7 @@
 from .conditions import PreparedCondition, ConditionSet, ConditionBuilder
 from .diffusion import DiffusionEngine, DiffusionConfig
 from .masking import LatentNoiseMask
+from .model_context import ModelContext
 from .ops import average_conditions, blend_semantic_hints, extract_semantic_hints
 
 __all__ = [
@@ -10,6 +11,7 @@ __all__ = [
     "DiffusionEngine",
     "DiffusionConfig",
     "LatentNoiseMask",
+    "ModelContext",
     "average_conditions",
     "blend_semantic_hints",
     "extract_semantic_hints",

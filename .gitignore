@@ -231,3 +231,4 @@ PortableGit/
 proxy_config.txt
 gradio_outputs/
 trt_engines/*
+notes/*

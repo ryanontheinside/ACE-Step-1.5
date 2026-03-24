@@ -24,7 +24,7 @@ from acestep.engine.diffusion import DiffusionConfig
 from acestep.engine.masking import LatentNoiseMask
 
 if TYPE_CHECKING:
-    from acestep.handler import AceStepHandler
+    from acestep.engine.model_context import ModelContext
 
 
 # -----------------------------------------------------------------------
@@ -67,25 +67,25 @@ def types_compatible(source_type: str, target_type: str) -> bool:
 @_register
 @dataclass
 class ModelHandle:
-    """Reference to the loaded ACE-Step model via the handler."""
+    """Reference to the loaded ACE-Step model (works with ModelContext or AceStepHandler)."""
     TYPE_NAME: ClassVar[str] = "MODEL"
-    handler: AceStepHandler
+    handler: Any  # ModelContext | AceStepHandler (duck-typed)
 
 
 @_register
 @dataclass
 class VAEHandle:
-    """Reference to the VAE via the handler."""
+    """Reference to the VAE (works with ModelContext or AceStepHandler)."""
     TYPE_NAME: ClassVar[str] = "VAE"
-    handler: AceStepHandler
+    handler: Any  # ModelContext | AceStepHandler (duck-typed)
 
 
 @_register
 @dataclass
 class CLIPHandle:
-    """Reference to the text encoder/tokenizer via the handler."""
+    """Reference to the text encoder/tokenizer (works with ModelContext or AceStepHandler)."""
     TYPE_NAME: ClassVar[str] = "CLIP"
-    handler: AceStepHandler
+    handler: Any  # ModelContext | AceStepHandler (duck-typed)
 
 
 # -----------------------------------------------------------------------

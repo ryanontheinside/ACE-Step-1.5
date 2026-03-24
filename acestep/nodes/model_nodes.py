@@ -40,10 +40,9 @@ class LoadModel(BaseNode):
         )
 
     def execute(self, **kwargs: Any) -> dict[str, Any]:
-        from acestep.handler import AceStepHandler
+        from acestep.engine.model_context import ModelContext
 
-        handler = AceStepHandler()
-        handler.initialize_service(
+        ctx = ModelContext(
             project_root=kwargs.get("project_root", "checkpoints"),
             config_path=kwargs.get("config_path", "acestep-v15-turbo"),
             device=kwargs.get("device", "auto"),
@@ -54,7 +53,7 @@ class LoadModel(BaseNode):
         )
 
         return {
-            "model": ModelHandle(handler=handler),
-            "clip": CLIPHandle(handler=handler),
-            "vae": VAEHandle(handler=handler),
+            "model": ModelHandle(handler=ctx),
+            "clip": CLIPHandle(handler=ctx),
+            "vae": VAEHandle(handler=ctx),
         }

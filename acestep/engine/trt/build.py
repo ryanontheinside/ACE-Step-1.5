@@ -90,10 +90,9 @@ def main():
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
-    from acestep.handler import AceStepHandler
+    from acestep.engine.model_context import ModelContext
 
-    handler = AceStepHandler()
-    handler.initialize_service(
+    handler = ModelContext(
         project_root=project_root,
         config_path=args.checkpoint,
         device=args.device,

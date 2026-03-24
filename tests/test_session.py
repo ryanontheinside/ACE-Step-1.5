@@ -189,8 +189,8 @@ class TestDecoding:
         """Encode then decode should produce audio similar to the original."""
         recon = session.decode(prepared_source.latent)
         # Trim to common length
-        orig = source_audio.waveform.float()
-        rec = recon.waveform.float().squeeze(0) if recon.waveform.ndim == 3 else recon.waveform.float()
+        orig = source_audio.waveform.float().cpu()
+        rec = recon.waveform.float().cpu().squeeze(0) if recon.waveform.ndim == 3 else recon.waveform.float().cpu()
         L = min(orig.shape[-1], rec.shape[-1])
         # Cosine similarity on the waveform (should be positive / correlated)
         cos = torch.nn.functional.cosine_similarity(

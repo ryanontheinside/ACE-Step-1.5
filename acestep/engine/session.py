@@ -92,7 +92,7 @@ class Session:
         vae_overlap: float = 0.5,
     ):
         import torch
-        from acestep.handler import AceStepHandler
+        from acestep.engine.model_context import ModelContext
 
         skip_decoder = bool(trt_engines and "decoder" in trt_engines)
         skip_vae = bool(
@@ -101,8 +101,7 @@ class Session:
             and "vae_decode" in trt_engines
         )
 
-        handler = AceStepHandler()
-        handler.initialize_service(
+        ctx = ModelContext(
             project_root=project_root,
             config_path=config_path,
             device=device,
@@ -114,9 +113,9 @@ class Session:
             skip_vae=skip_vae,
         )
 
-        self.model = ModelHandle(handler=handler)
-        self.clip = CLIPHandle(handler=handler)
-        self.vae = VAEHandle(handler=handler)
+        self.model = ModelHandle(handler=ctx)
+        self.clip = CLIPHandle(handler=ctx)
+        self.vae = VAEHandle(handler=ctx)
 
         # Windowed VAE decode config (seconds; 0 = full decode)
         self._vae_window = vae_window
@@ -126,8 +125,8 @@ class Session:
         if trt_engines:
             if "decoder" in trt_engines:
                 from acestep.engine.diffusion import DiffusionEngine
-                handler._diffusion_engine = DiffusionEngine(
-                    handler.model,
+                ctx._diffusion_engine = DiffusionEngine(
+                    ctx.model,
                     trt_engine_path=trt_engines["decoder"],
                 )
 
