@@ -17,7 +17,7 @@ torch.set_grad_enabled(False)
 PROJECT_ROOT = Path(__file__).parent.parent
 SAMPLE_RATE = 48000
 TEST_DURATION = 30.0  # seconds -- shorter for faster tests
-TEST_AUDIO = PROJECT_ROOT / "test_audio" / "new_order_confusion_60seconds.wav"
+TEST_AUDIO = PROJECT_ROOT / "tests/fixtures" / "new_order_confusion_60seconds.wav"
 
 
 def _find_trt_engines():

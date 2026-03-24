@@ -39,7 +39,7 @@ from acestep.engine.stream import StreamPipeline, SlotRequest
 from acestep.nodes.types import Audio, Latent
 
 PROJECT_ROOT = Path(__file__).parent.parent
-SOURCE_AUDIO = PROJECT_ROOT / "test_audio" / "new_order_confusion_60seconds.wav"
+SOURCE_AUDIO = PROJECT_ROOT / "tests/fixtures" / "new_order_confusion_60seconds.wav"
 OUTPUT_DIR = PROJECT_ROOT / "_debug_tests" / "stream_output"
 OUTPUT_FILE = OUTPUT_DIR / "stream_cover_denoise_sweep.wav"
 

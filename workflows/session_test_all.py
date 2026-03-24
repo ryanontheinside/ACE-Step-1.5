@@ -23,7 +23,7 @@ from acestep.nodes.mask_nodes import TemporalMask, SetLatentNoiseMask
 from acestep.nodes.semantic_nodes import SemanticExtract, SemanticBlend, SemanticHintsToLatent
 from acestep.nodes.vae_nodes import VAEDecodeAudio
 
-SOURCE_AUDIO = os.path.join(project_root, "test_audio", "new_order_confusion_60seconds.wav")
+SOURCE_AUDIO = os.path.join(project_root, "tests/fixtures", "new_order_confusion_60seconds.wav")
 LORA_PATH = r"C:\_dev\models\comfyui_models\loras\acestep1.5\deathsteap_1.safetensors"
 OUTPUT_DIR = os.path.join(project_root, "test_output", "session_all")
 

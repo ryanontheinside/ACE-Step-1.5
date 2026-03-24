@@ -30,7 +30,7 @@ from acestep.nodes.lora_nodes import LoadLoRA, ApplyLoRA, RemoveLoRA
 from acestep.nodes.diffusion_nodes import DiffusionConfigNode, Generate
 from acestep.constants import TASK_INSTRUCTIONS
 
-SOURCE_AUDIO = os.path.join(project_root, "test_audio", "new_order_confusion_60seconds.wav")
+SOURCE_AUDIO = os.path.join(project_root, "tests/fixtures", "new_order_confusion_60seconds.wav")
 OUTPUT_DIR = os.path.join(project_root, "test_output", "workflows")
 LORA_PATH = r"C:\_dev\models\comfyui_models\loras\acestep1.5\deathsteap_1.safetensors"
 LORA_STRENGTH = 1.3

@@ -28,7 +28,7 @@ from acestep.nodes.curve_nodes import CurveWave
 from acestep.nodes.diffusion_nodes import DiffusionConfigNode, Generate
 from acestep.constants import TASK_INSTRUCTIONS
 
-SOURCE_AUDIO = os.path.join(project_root, "test_audio", "new_order_confusion_60seconds.wav")
+SOURCE_AUDIO = os.path.join(project_root, "tests/fixtures", "new_order_confusion_60seconds.wav")
 OUTPUT_DIR = os.path.join(project_root, "test_output", "workflows")
 
 

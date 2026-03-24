@@ -44,7 +44,7 @@ from acestep.nodes.semantic_nodes import SemanticExtract, SemanticBlend, Semanti
 # Configuration (these would be VST knobs / DAW parameters)
 # ======================================================================
 
-SOURCE_AUDIO = os.path.join(project_root, "test_audio", "new_order_confusion_60seconds.wav")
+SOURCE_AUDIO = os.path.join(project_root, "tests/fixtures", "new_order_confusion_60seconds.wav")
 # Set to None to use source audio for timbre/hints, or a path to override
 TIMBRE_REF_AUDIO = None
 HINT_SOURCE_AUDIO = None

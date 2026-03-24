@@ -29,7 +29,7 @@ from acestep.engine.stream import StreamPipeline, SlotRequest
 from acestep.nodes.types import Audio, Latent
 
 PROJECT_ROOT = Path(__file__).parent.parent
-DEFAULT_AUDIO = PROJECT_ROOT / "test_audio" / "new_order_confusion_60seconds.wav"
+DEFAULT_AUDIO = PROJECT_ROOT / "tests/fixtures" / "new_order_confusion_60seconds.wav"
 SAMPLE_RATE = 48000
 T = 1500  # 60s at 25fps
 NUM_GENS = 5  # total generations per run (1 seeded + N-1 pure)

@@ -13,7 +13,7 @@ torch.set_grad_enabled(False)
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 TRT_ENGINE = os.path.join(PROJECT_ROOT, "trt_engines", "decoder_mixed_b8_s1500.engine")
-SOURCE_AUDIO = os.path.join(PROJECT_ROOT, "test_audio", "new_order_confusion_60seconds.wav")
+SOURCE_AUDIO = os.path.join(PROJECT_ROOT, "tests/fixtures", "new_order_confusion_60seconds.wav")
 SAMPLE_RATE = 48000
 
 from acestep.constants import TASK_INSTRUCTIONS

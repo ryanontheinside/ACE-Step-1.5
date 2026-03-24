@@ -36,7 +36,7 @@ def main():
     engine = handler._diffusion_engine
 
     data, sr = sf.read(
-        os.path.join(project_root, "test_audio", "new_order_confusion_60seconds.wav"),
+        os.path.join(project_root, "tests/fixtures", "new_order_confusion_60seconds.wav"),
         dtype="float32",
     )
     waveform = torch.from_numpy(data.T)[:2, :60 * 48000]
