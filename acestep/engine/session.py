@@ -26,7 +26,7 @@ When Daydream Scope integrates, its session management replaces this.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from acestep.constants import TASK_INSTRUCTIONS
 from acestep.nodes.types import (
@@ -389,3 +389,139 @@ class Session:
             RemoveLoRA().execute(
                 model=self.model, lora=self._lora_stack.pop(),
             )
+
+    # ------------------------------------------------------------------
+    # Streaming
+    # ------------------------------------------------------------------
+
+    def create_stream(
+        self,
+        *,
+        source: PreparedSource,
+        conditioning: Conditioning,
+        steps: int = 8,
+        shift: float = 3.0,
+        noise_sharing: float = 0.0,
+    ) -> "SessionStream":
+        """Create a streaming pipeline for interactive generation.
+
+        Returns a ``SessionStream`` that wraps the low-level
+        ``StreamPipeline`` and ``SlotRequest`` construction so callers
+        work with Session-level types only.
+        """
+        from .diffusion import DiffusionConfig
+        from .stream import StreamPipeline
+
+        engine = self.handler._diffusion_engine
+        config = DiffusionConfig(
+            infer_steps=steps, shift=shift, noise_on_cpu=True,
+        )
+        pipe = StreamPipeline(engine, config, noise_sharing=noise_sharing)
+
+        return SessionStream(
+            session=self,
+            pipeline=pipe,
+            config=config,
+            source=source,
+            conditioning=conditioning,
+        )
+
+
+class SessionStream:
+    """Interactive streaming pipeline bound to a Session.
+
+    Wraps ``StreamPipeline`` so callers work with ``Conditioning``,
+    ``PreparedSource``, and ``Latent`` instead of raw tensors and
+    ``SlotRequest``.
+
+    Created via ``Session.create_stream()``.
+    """
+
+    def __init__(
+        self,
+        session: Session,
+        pipeline: "StreamPipeline",
+        config: Any,
+        source: PreparedSource,
+        conditioning: Conditioning,
+    ):
+        import torch
+        self.session = session
+        self.pipeline = pipeline
+        self.config = config
+        self.source = source
+        self.conditioning = conditioning
+
+        device = session.handler.device
+        dtype = session.handler.dtype
+        T = source.latent.tensor.shape[1]
+
+        # Pre-build the tensors that stay constant across submissions
+        entry = conditioning.to_entries()[0]
+        self._encoder_hidden_states = entry.encoder_hidden_states
+        self._encoder_attention_mask = entry.encoder_attention_mask
+
+        ctx_lat = source.context_latent.tensor.to(device=device, dtype=dtype)
+        D = ctx_lat.shape[2]
+        cm = torch.ones(1, T, D, device=device, dtype=dtype)
+        self._context_latents = torch.cat([ctx_lat, cm], dim=-1)
+        self._source_latents = source.latent.tensor.to(device=device, dtype=dtype)
+
+    def submit(
+        self,
+        *,
+        denoise: float = 1.0,
+        seed: Optional[int] = None,
+        source_latents: Optional["torch.Tensor"] = None,
+        sde_denoise_curve: Optional["torch.Tensor"] = None,
+    ) -> None:
+        """Enqueue a generation request.
+
+        Args:
+            denoise: Denoise strength for this request.
+            seed: RNG seed (None = random).
+            source_latents: Override source latents (e.g. for latent
+                feedback). If None, uses the PreparedSource latents.
+            sde_denoise_curve: Per-frame denoise curve [1, T, 1].
+        """
+        from .stream import SlotRequest
+
+        self.pipeline.submit(SlotRequest(
+            encoder_hidden_states=self._encoder_hidden_states,
+            encoder_attention_mask=self._encoder_attention_mask,
+            context_latents=self._context_latents,
+            seed=seed,
+            source_latents=(
+                source_latents if source_latents is not None
+                else self._source_latents
+            ),
+            denoise=denoise,
+            sde_denoise_curve=sde_denoise_curve,
+        ))
+
+    def tick(self) -> Optional[Latent]:
+        """Advance the pipeline by one step.
+
+        Returns a finished ``Latent`` when available, otherwise None.
+        """
+        result = self.pipeline.tick()
+        if result is None:
+            return None
+        return Latent(tensor=result)
+
+    @property
+    def active_slots(self) -> int:
+        return self.pipeline.active_slots
+
+    @property
+    def source_latents(self) -> "torch.Tensor":
+        """The source latent tensor on device (read-only)."""
+        return self._source_latents
+
+    def set_shift(self, shift: float) -> None:
+        """Update the diffusion shift parameter, clearing cached schedules."""
+        self.config.shift = shift
+        self.pipeline._schedule_cache.clear()
+
+    def stats(self) -> dict:
+        return self.pipeline.stats()
